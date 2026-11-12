@@ -2,8 +2,6 @@
 
 Набор надстроек для собственного VPN-сервера на **Amnezia (AmneziaWG)**: блокировка российских ресурсов для клиентов VPN, свой DNS с фильтрацией, защита сервера и Telegram-бот для управления. Ставится одной командой поверх сервера, который вы уже настроили через приложение AmneziaVPN.
 
-_An add-on installer for self-hosted AmneziaWG servers: blocks Russian IP ranges for VPN clients, adds AdGuard Home with per-client filtering, server hardening and a Telegram admin bot. The UI and docs are in Russian._
-
 ## Возможности
 
 **Сервер и сеть**
