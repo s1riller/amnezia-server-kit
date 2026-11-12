@@ -1,0 +1,11 @@
+[Unit]
+Description=Block Russian IPs for VPN clients
+After=docker.service network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/block-ru.sh
+
+[Install]
+WantedBy=multi-user.target docker.service

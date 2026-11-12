@@ -1,0 +1,11 @@
+[Unit]
+Description=VPN network rules (SMTP block, DNS->AdGuard, BBR)
+After=docker.service network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/vpn-net.sh
+LogLevelMax=notice
+
+[Install]
+WantedBy=multi-user.target docker.service

@@ -1,0 +1,23 @@
+#!/bin/bash
+# Задать токен Telegram-бота и запустить его:  vpn-bot-token 123456:ABC-DEF...
+set -euo pipefail
+T="${1:-}"
+[ -n "$T" ] || { echo "Использование: vpn-bot-token <токен от @BotFather>"; exit 1; }
+ME=$(curl -fsS --max-time 15 "https://api.telegram.org/bot$T/getMe") || { echo "Telegram не принял токен"; exit 1; }
+python3 - "$T" <<'PY'
+import json, sys, secrets, os
+p = "/etc/vpn-bot/config.json"
+c = json.load(open(p)) if os.path.exists(p) else {}
+c["token"] = sys.argv[1]
+c.setdefault("admins", [])
+c.setdefault("setup_code", secrets.token_hex(4))
+json.dump(c, open(p, "w"), indent=2)
+PY
+chmod 600 /etc/vpn-bot/config.json
+systemctl enable vpn-bot.service >/dev/null 2>&1
+systemctl restart vpn-bot.service
+U=$(echo "$ME" | python3 -c 'import json,sys; print(json.load(sys.stdin)["result"]["username"])')
+CODE=$(python3 -c 'import json; print(json.load(open("/etc/vpn-bot/config.json"))["setup_code"])')
+ADM=$(python3 -c 'import json; print(len(json.load(open("/etc/vpn-bot/config.json"))["admins"]))')
+echo "Бот @$U запущен."
+[ "$ADM" = 0 ] && echo "Откройте его в Telegram и отправьте:  /start $CODE" || true
