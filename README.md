@@ -44,7 +44,7 @@ _An add-on installer for self-hosted AmneziaWG servers: blocks Russian IP ranges
 Подключитесь к серверу по SSH под `root` и выполните:
 
 ```bash
-curl -fsSLO https://raw.githubusercontent.com/s1riller/vpn-server-kit/main/install-vpn-kit.sh
+curl -fsSLO https://raw.githubusercontent.com/s1riller/amnezia-server-kit/main/install-vpn-kit.sh16:25
 less install-vpn-kit.sh          # по желанию: посмотрите, что будет выполнено
 bash install-vpn-kit.sh --token 1234567890:AAH...
 ```
