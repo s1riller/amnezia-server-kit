@@ -1,0 +1,4 @@
+# Скрипты выполняются на Linux: всегда LF, даже при checkout на Windows
+*.sh text eol=lf
+*.py text eol=lf
+src/** text eol=lf

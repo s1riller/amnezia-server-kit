@@ -13,12 +13,23 @@
 #  Запуск (на сервере, от root):
 #    bash install-vpn-kit.sh --token <токен бота от @BotFather>
 #  Повторный запуск безопасен: обновляет файлы, настройки сохраняются.
+#  Удаление:  bash install-vpn-kit.sh --uninstall
 # =====================================================================
 set -Eeuo pipefail
-KIT_VERSION="1.0"
+KIT_VERSION="1.1"
 AG_IP=172.29.172.253
+OPTIONS_FILE=/etc/vpn-kit/options
 
-TOKEN=""; RU_BLOCK=1; RU_DNS=1; ADGUARD=1; AUTO_REBOOT=1; BOT=1
+TOKEN=""; RU_BLOCK=1; RU_DNS=1; ADGUARD=1; AUTO_REBOOT=1; BOT=1; UNINSTALL=0; YES=0
+
+# Параметры прошлой установки: повторный запуск (обновление) их не сбрасывает
+if [ -r "$OPTIONS_FILE" ]; then
+  while IFS='=' read -r k v; do
+    case "$k" in
+      RU_BLOCK|RU_DNS|ADGUARD|AUTO_REBOOT|BOT) if [[ "$v" =~ ^[01]$ ]]; then printf -v "$k" '%s' "$v"; fi ;;
+    esac
+  done < "$OPTIONS_FILE"
+fi
 
 usage() { cat <<'EOF'
 Использование: bash install-vpn-kit.sh [параметры]
@@ -31,7 +42,12 @@ usage() { cat <<'EOF'
   --no-adguard        не ставить AdGuard Home (свой DNS, фильтрация, детский режим)
   --no-auto-reboot    не перезагружать сервер ночью после обновлений ядра
   --no-bot            не ставить Telegram-бота
+  --uninstall         удалить VPN Server Kit (AmneziaWG и клиенты остаются)
+  -y, --yes           не спрашивать подтверждение (для --uninstall)
   -h, --help          эта справка
+
+Параметры --no-… запоминаются: повторный запуск (обновление) их учитывает.
+Включить компонент обратно: --ru-block, --ru-dns, --adguard, --auto-reboot, --bot.
 EOF
 }
 
@@ -43,6 +59,13 @@ while [ $# -gt 0 ]; do
     --no-adguard)     ADGUARD=0; shift ;;
     --no-auto-reboot) AUTO_REBOOT=0; shift ;;
     --no-bot)         BOT=0; shift ;;
+    --ru-block)       RU_BLOCK=1; shift ;;
+    --ru-dns)         RU_DNS=1; shift ;;
+    --adguard)        ADGUARD=1; shift ;;
+    --auto-reboot)    AUTO_REBOOT=1; shift ;;
+    --bot)            BOT=1; shift ;;
+    --uninstall)      UNINSTALL=1; shift ;;
+    -y|--yes)         YES=1; shift ;;
     -h|--help)        usage; exit 0 ;;
     *) echo "Неизвестный параметр: $1"; echo; usage; exit 1 ;;
   esac
@@ -487,7 +510,8 @@ import urllib.error
 import urllib.request
 import uuid
 
-CONFIG_PATH = "/etc/vpn-bot/config.json"
+CONFIG_PATH = os.environ.get("VPN_BOT_CONFIG", "/etc/vpn-bot/config.json")
+KIT_OPTIONS = "/etc/vpn-kit/options"   # параметры установки (их учитывает повторный запуск установщика)
 DATA_DIR = "/var/lib/vpn-bot"
 CLIENTS_DIR = os.path.join(DATA_DIR, "clients")
 BACKUP_DIR = os.path.join(DATA_DIR, "backup")
@@ -564,6 +588,27 @@ def save_cfg():
         json.dump(CFG, f, indent=2, ensure_ascii=False)
     os.chmod(tmp, 0o600)
     os.replace(tmp, CONFIG_PATH)
+
+
+def set_kit_option(key, value):
+    """Запомнить выбор из меню бота, чтобы обновление установщиком его не сбросило."""
+    try:
+        with open(KIT_OPTIONS, encoding="utf-8") as f:
+            lines = f.read().splitlines()
+    except FileNotFoundError:
+        return   # установка версии 1.0 — файла параметров ещё нет
+    out, found = [], False
+    for line in lines:
+        if line.split("=", 1)[0] == key:
+            line, found = "%s=%s" % (key, value), True
+        out.append(line)
+    if not found:
+        out.append("%s=%s" % (key, value))
+    tmp = KIT_OPTIONS + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        f.write("\n".join(out) + "\n")
+    os.chmod(tmp, 0o644)
+    os.replace(tmp, KIT_OPTIONS)
 
 
 # ====================== Telegram API ======================
@@ -1674,15 +1719,18 @@ def handle_callback(cq):
             wait("Выключаю…")
             run(["systemctl", "disable", "--now", "block-ru.timer", "block-ru.service"])
             run([RU_SCRIPT, "stop"])
+            set_kit_option("RU_BLOCK", 0)
             show(view_ru())
         elif data == "ruipon":
             wait("Включаю…")
             run(["systemctl", "enable", "block-ru.timer", "block-ru.service"])
             run(["systemctl", "start", "block-ru.timer"])
             run(["systemctl", "start", "block-ru.service"], timeout=240)
+            set_kit_option("RU_BLOCK", 1)
             show(view_ru())
         elif data in ("rudnson", "rudnsoff"):
             set_ru_dns(data == "rudnson")
+            set_kit_option("RU_DNS", 1 if data == "rudnson" else 0)
             show(view_ru())
         elif data == "service":
             show(view_service())
@@ -1856,6 +1904,13 @@ def alert_shared(pub, eps, nchg, nhs):
         send(a, text, kb)
 
 
+def share_suspected(n_endpoints, n_changes, n_handshakes):
+    """Похоже ли, что один ключ одновременно используют несколько устройств (за окно SHARE_WINDOW)."""
+    return n_endpoints >= 2 and (
+        (n_changes >= SHARE_MIN_EP_CHANGES and n_handshakes >= SHARE_MIN_HANDSHAKES)
+        or n_changes >= SHARE_EP_ALONE)
+
+
 def share_watch():
     """Один ключ на двух устройствах: сервер «перескакивает» между их адресами и часто
     повторяет рукопожатие. Считаем смены адреса и рукопожатия в скользящем окне."""
@@ -1886,8 +1941,7 @@ def share_watch():
                     h["hss"].popleft()
                 eps = {x for _, a, b in h["chg"] for x in (a, b) if x}
                 nchg, nhs = len(h["chg"]), len(h["hss"])
-                if (len(eps) >= 2
-                        and ((nchg >= SHARE_MIN_EP_CHANGES and nhs >= SHARE_MIN_HANDSHAKES) or nchg >= SHARE_EP_ALONE)
+                if (share_suspected(len(eps), nchg, nhs)
                         and now - alerted.get(pub, 0) > SHARE_REALERT
                         and now > CFG.get("share_mute", {}).get(pub, 0)
                         and not is_blocked(pub)):
@@ -2017,6 +2071,19 @@ detect() {
   ok "Внешний интерфейс: $WAN"
 }
 
+save_options() {
+  put "$OPTIONS_FILE" 644 <<EOF
+# VPN Server Kit: параметры установки. Повторный запуск установщика их учитывает,
+# бот меняет RU_BLOCK и RU_DNS, когда вы переключаете блокировку в его меню.
+KIT_VERSION=$KIT_VERSION
+RU_BLOCK=$RU_BLOCK
+RU_DNS=$RU_DNS
+ADGUARD=$ADGUARD
+AUTO_REBOOT=$AUTO_REBOOT
+BOT=$BOT
+EOF
+}
+
 install_packages() {
   say "Установка пакетов (может занять несколько минут)"
   export DEBIAN_FRONTEND=noninteractive
@@ -2097,13 +2164,13 @@ setup_adguard() {
     -v /opt/adguardhome/work:/opt/adguardhome/work \
     -v /opt/adguardhome/conf:/opt/adguardhome/conf \
     adguard/adguardhome:latest >/dev/null
-  local i pass
-  for i in $(seq 1 60); do curl -fs -o /dev/null "http://$AG_IP:3000/control/install/get_addresses" && break; sleep 1; done
+  local pass
+  for _ in $(seq 1 60); do curl -fs -o /dev/null "http://$AG_IP:3000/control/install/get_addresses" && break; sleep 1; done
   pass=$(python3 -c 'import secrets, string; print("".join(secrets.choice(string.ascii_letters + string.digits) for _ in range(20)))')
   (umask 077; printf 'AdGuard Home\nURL (только через VPN): http://%s\nLogin: admin\nPassword: %s\n' "$AG_IP" "$pass" > /root/adguard-admin.txt)
   curl -fsS -o /dev/null -X POST "http://$AG_IP:3000/control/install/configure" -H 'Content-Type: application/json' \
     -d "{\"web\":{\"ip\":\"0.0.0.0\",\"port\":80},\"dns\":{\"ip\":\"0.0.0.0\",\"port\":53},\"username\":\"admin\",\"password\":\"$pass\"}"
-  for i in $(seq 1 60); do curl -fs -o /dev/null -u "admin:$pass" "http://$AG_IP/control/status" && break; sleep 1; done
+  for _ in $(seq 1 60); do curl -fs -o /dev/null -u "admin:$pass" "http://$AG_IP/control/status" && break; sleep 1; done
   # DNS-over-HTTPS наружу; без лимита запросов (все клиенты VPN могут прийти с одного адреса)
   ag_api POST /control/dns_config '{"upstream_dns":["https://dns.cloudflare.com/dns-query","https://dns.quad9.net/dns-query"],"bootstrap_dns":["1.1.1.1","9.9.9.9"],"fallback_dns":["1.1.1.1","9.9.9.9"],"upstream_mode":"parallel","ratelimit":0,"cache_size":8388608,"cache_optimistic":true,"dnssec_enabled":true}'
   ag_api PUT /control/querylog/config/update '{"enabled":true,"interval":86400000,"anonymize_client_ip":false,"ignored":[]}'
@@ -2141,7 +2208,7 @@ setup_ufw() {
   sed -i 's/^\(-A ufw-before-input -p icmp --icmp-type echo-request -j\) ACCEPT/\1 DROP/' /etc/ufw/before.rules
   ufw --force enable >/dev/null
   iptables -D INPUT -p icmp -m icmp --icmp-type 8 -j DROP 2>/dev/null || true
-  ok "открыты: SSH ($(echo $ports | tr ' ' ',')/tcp), AmneziaWG (${AWG_PORT:-?}/udp); ping скрыт"
+  ok "открыты: SSH ($(printf '%s\n' "$ports" | paste -sd, -)/tcp), AmneziaWG (${AWG_PORT:-?}/udp); ping скрыт"
   ok "новые протоколы, добавленные через приложение Amnezia, будут работать без настройки (Docker)"
 }
 
@@ -2234,6 +2301,70 @@ summary() {
   echo
 }
 
+uninstall() {
+  [ "$(id -u)" = 0 ] || die "Запустите от root (sudo -i)"
+  say "Удаление VPN Server Kit"
+  cat <<'EOF'
+   Будут удалены: Telegram-бот, AdGuard Home (с настройками и статистикой), блокировка RU,
+   правила для клиентов VPN (SMTP, DNS → AdGuard, детский режим, отключённые клиенты).
+   Останутся: AmneziaWG и все клиенты (в том числе созданные ботом), ufw, fail2ban,
+   автообновления и BBR. Контейнер VPN перезапустится, клиенты переподключатся за ~10 секунд.
+EOF
+  local nblocked
+  nblocked=$(python3 -c 'import json; print(len(json.load(open("/etc/vpn-bot/config.json")).get("blocked", [])))' 2>/dev/null || echo 0)
+  if [ "${nblocked:-0}" -gt 0 ]; then
+    warn "клиентов, отключённых в боте: $nblocked — после удаления они снова получат доступ."
+    warn "Если это не нужно, сначала удалите их в боте или в приложении Amnezia."
+  fi
+  if [ "$YES" != 1 ]; then
+    local ans=""
+    { read -r -p "   Удалить? [y/N] " ans </dev/tty; } 2>/dev/null || true
+    case "$ans" in
+      y|Y|yes|д|Д|да|Да) ;;
+      *) echo "   Отменено. Без вопросов: bash install-vpn-kit.sh --uninstall --yes"; exit 0 ;;
+    esac
+  fi
+
+  systemctl disable --now vpn-bot.service vpn-net.timer vpn-net.service block-ru.timer block-ru.service >/dev/null 2>&1 || true
+  if [ -x /usr/local/sbin/block-ru.sh ]; then /usr/local/sbin/block-ru.sh stop >/dev/null 2>&1 || true; fi
+  ok "сервисы остановлены, блокировка RU снята"
+
+  local wan chain bridge net c
+  wan=$(ip -4 route show default | awk '{print $5; exit}')
+  if iptables -n -L DOCKER-USER >/dev/null 2>&1; then chain=DOCKER-USER; else chain=FORWARD; fi
+  if [ -n "$wan" ]; then
+    while iptables -D "$chain" -o "$wan" -p tcp --dport 25 -j REJECT --reject-with tcp-reset 2>/dev/null; do :; done
+  fi
+  bridge=$(docker network inspect -f '{{index .Options "com.docker.network.bridge.name"}}' amnezia-dns-net 2>/dev/null || true)
+  [ -n "$bridge" ] || bridge=amn0
+  for net in $(ip -4 route show dev "$bridge" 2>/dev/null | awk '/ via / {print $1}'); do
+    ip route del "$net" dev "$bridge" 2>/dev/null || true
+  done
+  docker rm -f adguardhome >/dev/null 2>&1 || true
+  ok "AdGuard Home удалён, правила SMTP и маршруты сняты"
+
+  rm -rf /opt/vpn-bot /etc/vpn-bot /var/lib/vpn-bot /var/lib/block-ru /opt/adguardhome /etc/vpn-kit \
+         /root/adguard-admin.txt /run/adguard-sync.lock \
+         /usr/local/sbin/{block-ru.sh,vpn-net.sh,adguard-sync-clients,vpn-bot-token} \
+         /etc/systemd/system/{vpn-bot.service,vpn-net.service,vpn-net.timer,block-ru.service,block-ru.timer}
+  systemctl daemon-reload
+  ok "файлы удалены"
+
+  # Правила внутри контейнеров VPN (DNS → AdGuard, детский режим, отключённые) сбрасываются перезапуском.
+  # Без этого DNS клиентов уходил бы на удалённый AdGuard.
+  for c in $(docker ps --format '{{.Names}}' | grep '^amnezia-' | grep -v '^amnezia-dns' || true); do
+    docker restart "$c" >/dev/null && ok "перезапущен $c"
+  done
+  say "VPN Server Kit удалён"
+  echo "   ufw, fail2ban, автообновления и BBR остались. Отключить межсетевой экран: ufw disable"
+  echo
+}
+
+if [ "$UNINSTALL" = 1 ]; then
+  uninstall
+  exit 0
+fi
+
 detect
 install_packages
 setup_bbr
@@ -2245,4 +2376,5 @@ setup_ufw
 setup_fail2ban
 setup_bot
 selftest
+save_options
 summary

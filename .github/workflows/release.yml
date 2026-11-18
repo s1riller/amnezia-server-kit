@@ -1,0 +1,39 @@
+name: Release
+
+# Релиз создаётся тегом, совпадающим с KIT_VERSION в src/install.template.sh:
+#   git tag v1.1 && git push origin v1.1
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Проверки
+        run: |
+          python3 src/build.py /tmp/install-vpn-kit.sh
+          if ! cmp -s /tmp/install-vpn-kit.sh install-vpn-kit.sh; then
+            echo "::error::install-vpn-kit.sh не пересобран из src/"; exit 1
+          fi
+          ver=$(sed -n 's/^KIT_VERSION="\(.*\)"$/\1/p' install-vpn-kit.sh)
+          if [ "v$ver" != "$GITHUB_REF_NAME" ]; then
+            echo "::error::KIT_VERSION=$ver не совпадает с тегом $GITHUB_REF_NAME"; exit 1
+          fi
+          shellcheck -s bash install-vpn-kit.sh
+          python3 -m unittest discover -s tests
+
+      - name: Контрольная сумма
+        run: sha256sum install-vpn-kit.sh > install-vpn-kit.sh.sha256
+
+      - name: Релиз на GitHub
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" install-vpn-kit.sh install-vpn-kit.sh.sha256 \
+            --title "VPN Server Kit $GITHUB_REF_NAME" --generate-notes --verify-tag

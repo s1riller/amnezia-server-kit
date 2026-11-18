@@ -39,12 +39,10 @@
 
 ## Установка
 
-Подключитесь к серверу по SSH под `root` и выполните:
+Подключитесь к серверу по SSH под `root` и выполните одну команду:
 
 ```bash
-curl -fsSLO https://raw.githubusercontent.com/s1riller/amnezia-server-kit/main/install-vpn-kit.sh16:25
-less install-vpn-kit.sh          # по желанию: посмотрите, что будет выполнено
-bash install-vpn-kit.sh --token 1234567890:AAH...
+bash <(curl -fsSL https://github.com/s1riller/amnezia-server-kit/releases/latest/download/install-vpn-kit.sh) --token 1234567890:AAH...
 ```
 
 Установка занимает 2–5 минут. В конце скрипт проверяет результат и печатает код:
@@ -55,13 +53,24 @@ bash install-vpn-kit.sh --token 1234567890:AAH...
 
 Отправьте эту строку своему боту, и он откроет меню.
 
+### Если хотите сначала посмотреть скрипт
+
+К каждому релизу приложена контрольная сумма: по ней видно, что файл скачался целиком и совпадает с опубликованным.
+
+```bash
+curl -fsSLO https://github.com/s1riller/amnezia-server-kit/releases/latest/download/install-vpn-kit.sh
+curl -fsSLO https://github.com/s1riller/amnezia-server-kit/releases/latest/download/install-vpn-kit.sh.sha256
+sha256sum -c install-vpn-kit.sh.sha256
+less install-vpn-kit.sh
+bash install-vpn-kit.sh --token 1234567890:AAH...
+```
+
 ### С компьютера на Windows
 
-Скачайте `install-vpn-kit.sh` из репозитория и в PowerShell выполните:
+В PowerShell:
 
 ```powershell
-scp .\install-vpn-kit.sh root@<IP-сервера>:/root/
-ssh root@<IP-сервера> "bash /root/install-vpn-kit.sh --token <ТОКЕН>"
+ssh root@<IP-сервера> "bash <(curl -fsSL https://github.com/s1riller/amnezia-server-kit/releases/latest/download/install-vpn-kit.sh) --token <ТОКЕН>"
 ```
 
 ### Параметры
@@ -74,6 +83,9 @@ ssh root@<IP-сервера> "bash /root/install-vpn-kit.sh --token <ТОКЕН>
 | `--no-adguard`     | без AdGuard: не будет своего DNS, статистики по клиентам и детского режима                    |
 | `--no-auto-reboot` | не перезагружать сервер после обновлений ядра                                                 |
 | `--no-bot`         | без Telegram-бота                                                                             |
+| `--uninstall`      | удалить набор, см. [Удаление](#удаление)                                                      |
+
+Параметры запоминаются в `/etc/vpn-kit/options`, поэтому при обновлении их не нужно повторять. Включить компонент обратно: `--ru-block`, `--ru-dns`, `--adguard`, `--auto-reboot`, `--bot`. Если переключить блокировку RU в боте, выбор тоже сохранится.
 
 ## После установки
 
@@ -110,21 +122,23 @@ ssh root@<IP-сервера> "bash /root/install-vpn-kit.sh --token <ТОКЕН>
 
 ## Обновление
 
-Скачайте новую версию `install-vpn-kit.sh` и запустите ту же команду. Повторный запуск безопасен: токен, администраторы, клиенты, отключённые клиенты, детский режим и настройки AdGuard сохраняются, правила не дублируются.
+Запустите ту же команду установки, токен указывать не нужно:
+
+```bash
+bash <(curl -fsSL https://github.com/s1riller/amnezia-server-kit/releases/latest/download/install-vpn-kit.sh)
+```
+
+Повторный запуск безопасен: токен, администраторы, клиенты, отключённые клиенты, детский режим, настройки AdGuard и параметры установки сохраняются, правила не дублируются.
 
 ## Удаление
 
 ```bash
-systemctl disable --now vpn-bot.service vpn-net.timer vpn-net.service block-ru.timer block-ru.service
-docker rm -f adguardhome
-rm -rf /opt/vpn-bot /etc/vpn-bot /var/lib/vpn-bot /var/lib/block-ru /opt/adguardhome /root/adguard-admin.txt \
-       /usr/local/sbin/{block-ru.sh,vpn-net.sh,adguard-sync-clients,vpn-bot-token} \
-       /etc/systemd/system/{vpn-bot.service,vpn-net.service,vpn-net.timer,block-ru.service,block-ru.timer}
-systemctl daemon-reload
-reboot   # сбросит правила iptables, ipset и маршруты; контейнер Amnezia стартует с чистыми правилами
+bash <(curl -fsSL https://github.com/s1riller/amnezia-server-kit/releases/latest/download/install-vpn-kit.sh) --uninstall
 ```
 
-ufw, fail2ban, автообновления и BBR после удаления остаются. Это обычная защита сервера; ufw при желании отключается командой `ufw disable`. Клиенты, созданные через бота, остаются в Amnezia.
+Скрипт покажет, что будет удалено, и спросит подтверждение; `--yes` отключает вопрос. Удаляются бот, AdGuard Home, блокировка RU и правила для клиентов VPN, после чего контейнер VPN перезапускается с чистыми правилами (клиенты переподключатся примерно за 10 секунд).
+
+Остаются AmneziaWG и все клиенты, включая созданных через бота. Клиенты, которых вы отключили в боте, после удаления снова получат доступ, поэтому ненужных удалите заранее. Также остаются ufw, fail2ban, автообновления и BBR: это обычная защита сервера, ufw при желании отключается командой `ufw disable`.
 
 ## Конфиденциальность
 
@@ -135,14 +149,17 @@ AdGuard хранит журнал DNS-запросов 24 часа и стати
 `install-vpn-kit.sh` — это собранный файл: шаблон `src/install.template.sh` плюс встроенные в него файлы из `src/`. После правок пересоберите его:
 
 ```bash
-python3 src/build.py          # результат: ./install-vpn-kit.sh
+python3 src/build.py                       # результат: ./install-vpn-kit.sh
+python3 -m unittest discover -s tests -v   # тесты бота (Linux, без Docker и Telegram)
 ```
 
 Файлам нужны окончания строк LF, сборщик приводит их к LF сам.
 
+GitHub Actions на каждый push проверяет, что `install-vpn-kit.sh` пересобран из `src/`, прогоняет shellcheck и тесты на Python 3.10–3.12. Релиз создаётся тегом, совпадающим с `KIT_VERSION` в `src/install.template.sh`: `git tag v1.1 && git push origin v1.1`. К релизу прикладываются установщик и его контрольная сумма SHA-256.
+
 ## Совместимость и статус
 
-Версия **1.0**. Проверено на Ubuntu 26.04, AmneziaWG 2 (контейнер `amnezia-awg2`), AdGuard Home v0.107.80: каждый компонент на рабочем сервере и повторный запуск установщика поверх существующей установки. Установка на новый сервер «с нуля» пока проверена мало, поэтому первый раз лучше попробовать на тестовом VPS. Об ошибках пишите в [Issues](../../issues).
+Версия **1.1**. Проверено на Ubuntu 26.04, AmneziaWG 2 (контейнер `amnezia-awg2`), AdGuard Home v0.107.80: каждый компонент на рабочем сервере и повторный запуск установщика поверх существующей установки. Установка на новый сервер «с нуля» пока проверена мало, поэтому первый раз лучше попробовать на тестовом VPS. Об ошибках пишите в [Issues](../../issues).
 
 - Блокировка RU и запрет SMTP действуют для всех протоколов Amnezia на сервере.
 - Бот, AdGuard по клиентам и детский режим работают с AmneziaWG.

@@ -25,7 +25,8 @@ import urllib.error
 import urllib.request
 import uuid
 
-CONFIG_PATH = "/etc/vpn-bot/config.json"
+CONFIG_PATH = os.environ.get("VPN_BOT_CONFIG", "/etc/vpn-bot/config.json")
+KIT_OPTIONS = "/etc/vpn-kit/options"   # параметры установки (их учитывает повторный запуск установщика)
 DATA_DIR = "/var/lib/vpn-bot"
 CLIENTS_DIR = os.path.join(DATA_DIR, "clients")
 BACKUP_DIR = os.path.join(DATA_DIR, "backup")
@@ -102,6 +103,27 @@ def save_cfg():
         json.dump(CFG, f, indent=2, ensure_ascii=False)
     os.chmod(tmp, 0o600)
     os.replace(tmp, CONFIG_PATH)
+
+
+def set_kit_option(key, value):
+    """Запомнить выбор из меню бота, чтобы обновление установщиком его не сбросило."""
+    try:
+        with open(KIT_OPTIONS, encoding="utf-8") as f:
+            lines = f.read().splitlines()
+    except FileNotFoundError:
+        return   # установка версии 1.0 — файла параметров ещё нет
+    out, found = [], False
+    for line in lines:
+        if line.split("=", 1)[0] == key:
+            line, found = "%s=%s" % (key, value), True
+        out.append(line)
+    if not found:
+        out.append("%s=%s" % (key, value))
+    tmp = KIT_OPTIONS + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        f.write("\n".join(out) + "\n")
+    os.chmod(tmp, 0o644)
+    os.replace(tmp, KIT_OPTIONS)
 
 
 # ====================== Telegram API ======================
@@ -1212,15 +1234,18 @@ def handle_callback(cq):
             wait("Выключаю…")
             run(["systemctl", "disable", "--now", "block-ru.timer", "block-ru.service"])
             run([RU_SCRIPT, "stop"])
+            set_kit_option("RU_BLOCK", 0)
             show(view_ru())
         elif data == "ruipon":
             wait("Включаю…")
             run(["systemctl", "enable", "block-ru.timer", "block-ru.service"])
             run(["systemctl", "start", "block-ru.timer"])
             run(["systemctl", "start", "block-ru.service"], timeout=240)
+            set_kit_option("RU_BLOCK", 1)
             show(view_ru())
         elif data in ("rudnson", "rudnsoff"):
             set_ru_dns(data == "rudnson")
+            set_kit_option("RU_DNS", 1 if data == "rudnson" else 0)
             show(view_ru())
         elif data == "service":
             show(view_service())
@@ -1394,6 +1419,13 @@ def alert_shared(pub, eps, nchg, nhs):
         send(a, text, kb)
 
 
+def share_suspected(n_endpoints, n_changes, n_handshakes):
+    """Похоже ли, что один ключ одновременно используют несколько устройств (за окно SHARE_WINDOW)."""
+    return n_endpoints >= 2 and (
+        (n_changes >= SHARE_MIN_EP_CHANGES and n_handshakes >= SHARE_MIN_HANDSHAKES)
+        or n_changes >= SHARE_EP_ALONE)
+
+
 def share_watch():
     """Один ключ на двух устройствах: сервер «перескакивает» между их адресами и часто
     повторяет рукопожатие. Считаем смены адреса и рукопожатия в скользящем окне."""
@@ -1424,8 +1456,7 @@ def share_watch():
                     h["hss"].popleft()
                 eps = {x for _, a, b in h["chg"] for x in (a, b) if x}
                 nchg, nhs = len(h["chg"]), len(h["hss"])
-                if (len(eps) >= 2
-                        and ((nchg >= SHARE_MIN_EP_CHANGES and nhs >= SHARE_MIN_HANDSHAKES) or nchg >= SHARE_EP_ALONE)
+                if (share_suspected(len(eps), nchg, nhs)
                         and now - alerted.get(pub, 0) > SHARE_REALERT
                         and now > CFG.get("share_mute", {}).get(pub, 0)
                         and not is_blocked(pub)):

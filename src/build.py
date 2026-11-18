@@ -32,6 +32,8 @@ def read(name):
 
 
 def main():
+    if hasattr(sys.stdout, "reconfigure"):   # консоль Windows (cp1252/cp866) не печатает кириллицу
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
     tpl = read("install.template.sh")
     marker = "#@@FILES@@\n"
     if marker not in tpl:

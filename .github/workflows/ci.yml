@@ -1,0 +1,47 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: install-vpn-kit.sh собран из src/
+        run: |
+          python3 src/build.py /tmp/install-vpn-kit.sh
+          if ! cmp -s /tmp/install-vpn-kit.sh install-vpn-kit.sh; then
+            echo "::error file=install-vpn-kit.sh::Установщик устарел: выполните python3 src/build.py и закоммитьте результат"
+            diff -u install-vpn-kit.sh /tmp/install-vpn-kit.sh | head -60
+            exit 1
+          fi
+
+      - name: shellcheck
+        run: shellcheck -s bash src/install.template.sh src/block-ru.sh src/vpn-net.sh src/vpn-bot-token install-vpn-kit.sh
+
+      - name: Синтаксис bash
+        run: bash -n install-vpn-kit.sh
+
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        # 3.10 — Ubuntu 22.04, 3.11 — Debian 12, 3.12 — Ubuntu 24.04
+        python: ["3.10", "3.11", "3.12"]
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+
+      - name: Синтаксис Python
+        run: python -c 'import ast, sys; [ast.parse(open(f, encoding="utf-8").read(), f) for f in sys.argv[1:]]' src/bot.py src/adguard-sync-clients src/build.py
+
+      - name: Тесты
+        run: python -m unittest discover -s tests -v
