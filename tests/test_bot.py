@@ -232,6 +232,19 @@ class RequestsTest(FakeAwg):
         self.assertNotIn("expires", cd)
         self.assertNotIn("limit_gb", cd)
 
+    def test_backup_pass_view_and_set(self):
+        bot.CFG.pop("backup_pass", None)
+        p1, new = bot.backup_passphrase()           # создаётся при первом обращении
+        self.assertTrue(new and p1)
+        p2, new2 = bot.backup_passphrase()          # повторно — тот же, не новый
+        self.assertEqual(p1, p2)
+        self.assertFalse(new2)
+        self.assertEqual(bot.set_backup_pass("my-secret-123"), "my-secret-123")
+        self.assertEqual(bot.CFG["backup_pass"], "my-secret-123")
+        gen = bot.set_backup_pass("")               # пустой -> случайный
+        self.assertTrue(gen and gen != "my-secret-123")
+        bot.CFG.pop("backup_pass", None)
+
 
 class TrafficTest(unittest.TestCase):
     def test_account_delta_normal(self):

@@ -1361,6 +1361,29 @@ def backup_passphrase():
     return p, new
 
 
+def set_backup_pass(value):
+    """Задать свой пароль бэкапа (или сгенерировать, если value пуст). -> новый пароль."""
+    import secrets
+    CFG["backup_pass"] = (value or "").strip() or secrets.token_urlsafe(18)
+    save_cfg()
+    return CFG["backup_pass"]
+
+
+def view_bpass():
+    p = CFG.get("backup_pass")
+    if p:
+        text = ("🔑 <b>Пароль шифрования бэкапа</b>\n\n"
+                "Текущий пароль (нажмите, чтобы увидеть):\n<tg-spoiler><code>%s</code></tg-spoiler>\n\n"
+                "Им открываются зашифрованные бэкапы. Сохраните его отдельно: если потеряете "
+                "и сервер, и пароль одновременно — старый бэкап восстановить будет нельзя." % e(p))
+    else:
+        text = ("🔑 <b>Пароль шифрования бэкапа</b>\n\n"
+                "Пароль ещё не создан — он появится при первом бэкапе (💾 Бэкап в Telegram) и будет показан.")
+    kb = [[btn("🔁 Новый случайный", "bpgen"), btn("✏️ Задать свой", "bpset")],
+          [btn("⬅️ Сервис", "service")]]
+    return text, kb
+
+
 def make_backup():
     """-> (имя_файла, зашифрованные_байты, пароль, пароль_новый). Шифрование openssl AES-256 + PBKDF2.
     Пароль передаётся openssl через окружение (env:), а данные tar — через pipe."""
@@ -1973,7 +1996,7 @@ def view_service():
                 e(str(ver)), ("\n⬆️ Доступна версия <b>%s</b>" % e(str(nv)) if nv else ""),
                 e(srv_name()), REPORT_LABELS[mode]))
     kb = [[btn("✏️ Имя сервера", "srvname")],
-          [btn("💾 Бэкап в Telegram", "backup")],
+          [btn("💾 Бэкап в Telegram", "backup"), btn("🔑 Пароль бэкапа", "bpass")],
           [btn("⬆️ Обновить набор" if nv else "⬆️ Проверить обновления", "update")],
           [btn("📈 Отчёт: %s" % REPORT_LABELS[mode], "reptgl")],
           [btn("🔄 Перезапустить VPN", "ask:rvpn")],
@@ -2460,6 +2483,17 @@ def handle_callback(cq):
         elif data == "backup":
             do_backup(chat)
             show(view_service())
+        elif data == "bpass":
+            show(view_bpass())
+        elif data == "bpgen":
+            new = set_backup_pass("")
+            send(chat, "✅ Новый случайный пароль бэкапа создан:\n<tg-spoiler><code>%s</code></tg-spoiler>\n\n"
+                       "⚠️ Бэкапы, сделанные со старым паролем, теперь открываются только старым паролем." % e(new))
+            show(view_bpass())
+        elif data == "bpset":
+            pending[chat] = "bpass"
+            show(("✏️ Отправьте новый пароль бэкапа (минимум 6 символов). /cancel — отмена.\n\n"
+                  "⚠️ Прежние бэкапы останутся на старом пароле.", [[btn("⬅️ Назад", "bpass")]]))
         elif data == "update":
             wait("Проверяю обновления…")
             nv = check_update()
@@ -2541,6 +2575,15 @@ def handle_message(m):
         save_cfg()
         send(chat, "✅ Имя сервера: <b>%s</b>. Оно попадёт в новые выданные конфиги "
                    "(AmneziaVPN). Выданные ранее не меняются — при необходимости перевыдайте." % e(srv_name()))
+        send(chat, *view_service())
+        return
+    if pend == "bpass" and text and not text.startswith("/"):
+        if len(text.strip()) < 6:
+            send(chat, "Пароль слишком короткий (нужно ≥ 6 символов). Попробуйте ещё раз или /cancel.")
+            return
+        pending.pop(chat, None)
+        set_backup_pass(text)
+        send(chat, "✅ Пароль бэкапа установлен. ⚠️ Прежние бэкапы открываются старым паролем.")
         send(chat, *view_service())
         return
 
