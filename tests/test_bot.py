@@ -438,15 +438,21 @@ PrivateKey = cPRIVKEY
 Address = 10.8.1.2/32
 DNS = 1.1.1.1, 1.0.0.1
 MTU = 1376
-Jc = 4
+Jc = 6
 Jmin = 10
 Jmax = 50
-S1 = 58
-S2 = 106
-H1 = 1111
-H2 = 2222
-H3 = 3333
-H4 = 4444
+S1 = 12
+S2 = 12
+S3 = 12
+S4 = 12
+H1 = 1
+H2 = 2
+H3 = 3
+H4 = 4
+HeaderProtectionKey = xEX1Pjj+SNmQxXO3kr1YPsyCbPkvwYn7Xg/x4JrJ0Zw=
+RekeyAfterTime = 100-120
+RandomTrailers = on
+DisableCookies = on
 
 [Peer]
 PublicKey = sPUBKEY
@@ -469,15 +475,23 @@ class VpnUriTest(unittest.TestCase):
         self.assertEqual(o["containers"][0]["container"], "amnezia-awg")
         self.assertEqual(awg["transport_proto"], "udp")
         self.assertEqual(awg["port"], "51820")
+        self.assertEqual(o["format_version"], 1)
         last = json.loads(awg["last_config"])
         self.assertEqual(last["client_ip"], "10.8.1.2/32")
         self.assertEqual(last["client_priv_key"], "cPRIVKEY")
         self.assertEqual(last["server_pub_key"], "sPUBKEY")
         self.assertEqual(last["psk_key"], "PSKKEY")
         self.assertEqual(last["port"], 51820)
-        self.assertEqual(last["H1"], "1111")
+        self.assertEqual(last["H1"], "1")
         self.assertEqual(last["allowed_ips"], ["0.0.0.0/0", "::/0"])
         self.assertIn("[Interface]", last["config"])
+        # все параметры AmneziaWG 2.0 из [Interface] должны быть отдельными полями
+        for k, v in (("S3", "12"), ("S4", "12"), ("HeaderProtectionKey", "xEX1Pjj+SNmQxXO3kr1YPsyCbPkvwYn7Xg/x4JrJ0Zw="),
+                     ("RekeyAfterTime", "100-120"), ("RandomTrailers", "on"), ("DisableCookies", "on")):
+            self.assertEqual(last[k], v)
+        # базовые WG-ключи не дублируются отдельными полями
+        for k in ("PrivateKey", "Address", "DNS", "MTU"):
+            self.assertNotIn(k, last)
 
     def test_length_prefix(self):
         import struct as _s, base64 as _b, zlib as _z

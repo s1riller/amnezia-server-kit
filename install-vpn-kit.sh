@@ -16,7 +16,7 @@
 #  Удаление:  bash install-vpn-kit.sh --uninstall
 # =====================================================================
 set -Eeuo pipefail
-KIT_VERSION="1.3"
+KIT_VERSION="1.3.1"
 AG_IP=172.29.172.253
 OPTIONS_FILE=/etc/vpn-kit/options
 
@@ -1079,7 +1079,9 @@ def save_client_conf(pub, text):
 # Формат: "vpn://" + base64url(4 байта длины JSON (big-endian) + zlib(JSON)).
 # Имя, которое видит пользователь в приложении, — верхнее поле "description".
 SRV_NAME_DEFAULT = "AmneziaWG"
-AWG_OBFS = ["Jc", "Jmin", "Jmax", "S1", "S2", "S3", "S4", "H1", "H2", "H3", "H4", "I1"]
+# базовые ключи [Interface] WireGuard — у них в vpn:// свои поля (client_priv_key/client_ip/mtu/dns),
+# поэтому их НЕ дублируем; всё остальное (параметры AmneziaWG) переносим как есть
+IFACE_STD_KEYS = {"PrivateKey", "Address", "DNS", "MTU", "ListenPort"}
 
 
 def srv_name():
@@ -1115,9 +1117,12 @@ def build_vpn_uri(conf_text, name):
         "psk_key": peer.get("PresharedKey", ""),
         "server_pub_key": peer.get("PublicKey", ""),
     }
-    for k in AWG_OBFS:
-        if k in iface:
-            last[k] = iface[k]
+    # Все параметры AmneziaWG из [Interface] (кроме базовых WG) — отдельными полями,
+    # как делает само приложение: иначе оно пересобирает туннель без обфускации AWG 2.0
+    # (S3/S4, H1–H4, HeaderProtectionKey, Rekey*, RandomTrailers, DisableCookies …) и не подключается.
+    for k, v in iface.items():
+        if k not in IFACE_STD_KEYS:
+            last[k] = v
     awg = {"isThirdPartyConfig": True, "last_config": json.dumps(last, ensure_ascii=False),
            "port": str(port), "transport_proto": "udp"}
     outer = {
@@ -1126,6 +1131,7 @@ def build_vpn_uri(conf_text, name):
         "description": name,
         "dns1": dns[0] if dns else "1.1.1.1",
         "dns2": dns[1] if len(dns) > 1 else "1.0.0.1",
+        "format_version": 1,
         "hostName": host,
     }
     js = json.dumps(outer, ensure_ascii=False).encode()
