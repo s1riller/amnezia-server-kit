@@ -30,6 +30,9 @@ KIT_OPTIONS = "/etc/vpn-kit/options"   # параметры установки (
 DATA_DIR = "/var/lib/vpn-bot"
 CLIENTS_DIR = os.path.join(DATA_DIR, "clients")
 BACKUP_DIR = os.path.join(DATA_DIR, "backup")
+TRAFFIC_PATH = os.path.join(DATA_DIR, "traffic.json")   # помесячный учёт, пишется часто — отдельно от config.json
+
+GB = 1024 ** 3
 
 AWG_CONTAINER = "amnezia-awg2"
 AWG_DIR = "/opt/amnezia/awg"
@@ -41,6 +44,7 @@ AWG_IF = "awg0"
 CLIENT_DNS = "1.1.1.1, 1.0.0.1"   # всё равно перенаправляется в AdGuard на сервере
 CLIENT_MTU = "1376"
 ONLINE_SEC = 180                   # «онлайн», если рукопожатие было не раньше N секунд назад
+REPORT_HOUR = 9                    # час отправки регулярного отчёта (время сервера)
 
 ADGUARD_CONTAINER = "adguardhome"
 ADGUARD_IP = "172.29.172.253"
@@ -124,6 +128,86 @@ def set_kit_option(key, value):
         f.write("\n".join(out) + "\n")
     os.chmod(tmp, 0o644)
     os.replace(tmp, KIT_OPTIONS)
+
+
+# ====================== данные по клиентам (срок, лимит) ======================
+# В config.json под ключом "clients": {pub: {"expires": "YYYY-MM-DD"|None,
+#   "limit_gb": число|None, "auto_off": "expired"|"limit"|None, "warned": "YYYY-MM-DD"|None}}
+def cdata(pub):
+    return CFG.get("clients", {}).get(pub, {})
+
+
+def set_cdata(pub, **kw):
+    c = CFG.setdefault("clients", {}).setdefault(pub, {})
+    for k, v in kw.items():
+        if v is None and k in c:
+            del c[k]
+        elif v is not None:
+            c[k] = v
+    if not c:
+        CFG["clients"].pop(pub, None)
+    save_cfg()
+
+
+# ====================== помесячный учёт трафика ======================
+def cur_month():
+    return time.strftime("%Y-%m")
+
+
+def load_traffic():
+    try:
+        with open(TRAFFIC_PATH, encoding="utf-8") as f:
+            t = json.load(f)
+        return t if isinstance(t, dict) else {}
+    except (FileNotFoundError, ValueError):
+        return {}
+
+
+def save_traffic(t):
+    tmp = TRAFFIC_PATH + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(t, f, ensure_ascii=False)
+    os.chmod(tmp, 0o600)
+    os.replace(tmp, TRAFFIC_PATH)
+
+
+def account_delta(prev_raw, cur_raw):
+    """Прирост счётчика с учётом обнуления (перезапуск контейнера сбрасывает счётчики awg в 0)."""
+    return cur_raw - prev_raw if cur_raw >= prev_raw else cur_raw
+
+
+def roll_month(entry, month, cur_rx, cur_tx):
+    """Обновить запись трафика одного клиента. Новый месяц (или первая запись) — счёт с нуля."""
+    if not entry or entry.get("month") != month:
+        return {"month": month, "rx": 0, "tx": 0, "last_rx": cur_rx, "last_tx": cur_tx}
+    return {"month": month,
+            "rx": entry["rx"] + account_delta(entry["last_rx"], cur_rx),
+            "tx": entry["tx"] + account_delta(entry["last_tx"], cur_tx),
+            "last_rx": cur_rx, "last_tx": cur_tx}
+
+
+def used_bytes(pub, traffic=None):
+    """Трафик клиента за текущий месяц (rx+tx), байт."""
+    t = (traffic if traffic is not None else load_traffic()).get(pub)
+    if not t or t.get("month") != cur_month():
+        return 0
+    return t.get("rx", 0) + t.get("tx", 0)
+
+
+def account_traffic():
+    """Снять текущие счётчики по всем пирам и обновить помесячный учёт. -> {pub: использовано_байт}."""
+    dump = awg_dump()
+    traffic = load_traffic()
+    month = cur_month()
+    changed = False
+    for pub, d in dump.items():
+        new = roll_month(traffic.get(pub), month, d.get("rx", 0), d.get("tx", 0))
+        if new != traffic.get(pub):
+            traffic[pub] = new
+            changed = True
+    if changed:
+        save_traffic(traffic)
+    return {pub: (t.get("rx", 0) + t.get("tx", 0)) for pub, t in traffic.items() if t.get("month") == month}
 
 
 # ====================== Telegram API ======================
@@ -544,7 +628,14 @@ def rekey_client(pub):
     if blocked:
         CFG["blocked"] = [newpub if p == pub else p for p in CFG.get("blocked", [])]
     CFG.get("share_mute", {}).pop(pub, None)
+    cd = CFG.get("clients", {}).pop(pub, None)       # срок и лимит переносим на новый ключ
+    if cd:
+        CFG.setdefault("clients", {})[newpub] = cd
     save_cfg()
+    tr = load_traffic()                              # и накопленный за месяц трафик
+    if pub in tr:
+        tr[newpub] = tr.pop(pub)
+        save_traffic(tr)
     ag_state_repub(ip, newpub)   # чтобы синхронизация AdGuard не сбросила настройки (детский режим)
     return {"pub": newpub, "ip": ip, "conf": text}
 
@@ -618,6 +709,199 @@ def set_blocked(pub, on):
     run([VPN_NET_SCRIPT], timeout=60)
 
 
+# ====================== срок действия и лимит трафика ======================
+def today_str():
+    return time.strftime("%Y-%m-%d")
+
+
+def is_expired(cd, today=None):
+    exp = cd.get("expires")
+    return bool(exp) and (today or today_str()) > exp
+
+
+def is_over_limit(cd, used):
+    lim = cd.get("limit_gb")
+    return bool(lim) and used >= lim * GB
+
+
+def auto_disable(pub, reason):
+    """Отключить клиента автоматически (истёк срок/лимит) и уведомить админов."""
+    set_cdata(pub, auto_off=reason)
+    if pub not in CFG.get("blocked", []):
+        set_blocked(pub, True)
+    c = find_client(pub)
+    name = e(c["name"]) if c else pub[:8]
+    if reason == "expired":
+        txt = "⛔ Клиент <b>%s</b> отключён: истёк срок действия." % name
+        kb = [[btn("➕ Продлить 30 дней", "cext:" + pub), btn("👤 Клиент", "c:" + pub)]]
+    else:
+        txt = "⛔ Клиент <b>%s</b> отключён: исчерпан месячный лимит трафика." % name
+        kb = [[btn("♻️ Сбросить лимит", "clrst:" + pub), btn("👤 Клиент", "c:" + pub)]]
+    log("auto-disable:", reason, c["name"] if c else pub[:8])
+    for a in ADMINS:
+        send(a, txt, kb)
+
+
+def check_access(used):
+    """Проверка сроков и лимитов. used: {pub: байт за текущий месяц}. Вызывается раз в минуту."""
+    today = today_str()
+    tomorrow = time.strftime("%Y-%m-%d", time.localtime(time.time() + 86400))
+    blocked = set(CFG.get("blocked", []))
+    for pub, cd in list(CFG.get("clients", {}).items()):
+        u = used.get(pub, 0)
+        expired, over = is_expired(cd, today), is_over_limit(cd, u)
+        off = cd.get("auto_off")
+        if off:
+            if not expired and not over:   # срок продлили или начался новый месяц — вернуть доступ
+                set_cdata(pub, auto_off=None)
+                if pub in blocked:
+                    set_blocked(pub, False)
+                c = find_client(pub)
+                notify_admins("✅ Клиент <b>%s</b>: доступ восстановлен (%s)." % (
+                    e(c["name"]) if c else pub[:8], "срок продлён" if off == "expired" else "новый месяц"))
+            continue
+        if pub in blocked:
+            continue                        # отключён вручную админом — автоматику не применяем
+        if expired:
+            auto_disable(pub, "expired")
+        elif over:
+            auto_disable(pub, "limit")
+        elif cd.get("expires") == tomorrow and cd.get("warned") != tomorrow:
+            set_cdata(pub, warned=tomorrow)
+            c = find_client(pub)
+            notify_admins("⏳ У клиента <b>%s</b> завтра (%s) истекает срок действия." % (
+                e(c["name"]) if c else pub[:8], tomorrow))
+
+
+# ====================== бэкап и обновление ======================
+REPO = "s1riller/amnezia-server-kit"
+INSTALLER_URL = "https://github.com/%s/releases/latest/download/install-vpn-kit.sh" % REPO
+UPDATE_SENTINEL = os.path.join(DATA_DIR, "updated-to")   # версия, о которой нужно сообщить после перезапуска
+# что кладём в бэкап (пути относительно /, только существующие)
+BACKUP_PATHS = ["etc/vpn-bot", "etc/vpn-kit", "var/lib/vpn-bot", "opt/adguardhome/conf", "root/adguard-admin.txt"]
+
+
+def kit_option(key, default=""):
+    try:
+        with open(KIT_OPTIONS, encoding="utf-8") as f:
+            for line in f:
+                if line.split("=", 1)[0] == key and "=" in line:
+                    return line.split("=", 1)[1].strip()
+    except FileNotFoundError:
+        pass
+    return default
+
+
+def backup_passphrase():
+    """Пароль шифрования бэкапа: генерируем один раз и храним, чтобы последующие бэкапы шли тем же паролем."""
+    p = CFG.get("backup_pass")
+    new = not p
+    if new:
+        import secrets
+        p = secrets.token_urlsafe(18)
+        CFG["backup_pass"] = p
+        save_cfg()
+    return p, new
+
+
+def make_backup():
+    """-> (имя_файла, зашифрованные_байты, пароль, пароль_новый). Шифрование openssl AES-256 + PBKDF2.
+    Пароль передаётся openssl через окружение (env:), а данные tar — через pipe."""
+    paths = [p for p in BACKUP_PATHS if os.path.exists("/" + p)]
+    if not paths:
+        raise RuntimeError("нечего сохранять")
+    pw, new = backup_passphrase()
+    env = dict(os.environ, VPNKIT_BACKUP_PW=pw)
+    tar = subprocess.Popen(["tar", "czf", "-", "-C", "/"] + paths,
+                           stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+    enc = subprocess.run(["openssl", "enc", "-aes-256-cbc", "-pbkdf2", "-salt", "-pass", "env:VPNKIT_BACKUP_PW"],
+                         stdin=tar.stdout, capture_output=True, env=env)
+    tar.stdout.close()
+    tar.wait()
+    if tar.returncode not in (0, None) or enc.returncode != 0:
+        raise RuntimeError("tar/openssl: " + (enc.stderr.decode(errors="replace")[:200] or "ошибка"))
+    return "vpn-kit-backup-%s.tar.gz.enc" % time.strftime("%Y%m%d-%H%M%S"), enc.stdout, pw, new
+
+
+def do_backup(chat):
+    send(chat, "⏳ Готовлю зашифрованный бэкап…")
+    try:
+        fname, data, pw, new = make_backup()
+    except Exception as ex:
+        log("backup:", traceback.format_exc())
+        send(chat, "❌ Не удалось сделать бэкап: %s" % e(str(ex)), [BACK])
+        return
+    cap = ("💾 Зашифрованный бэкап (клиенты, ключи, настройки AdGuard и бота).\n"
+           "Восстановление на новом сервере:\n"
+           "<code>bash install-vpn-kit.sh --restore %s</code>") % fname
+    send_file(chat, fname, data, cap, "application/octet-stream")
+    if new:
+        send(chat, "🔑 <b>Пароль для восстановления</b> (сохраните — показывается один раз):\n"
+                   "<code>%s</code>\n\nБез него восстановить бэкап нельзя." % e(pw))
+    else:
+        send(chat, "Пароль для восстановления — тот же, что был показан при первом бэкапе.")
+
+
+def ver_tuple(s):
+    return tuple(int(x) for x in re.findall(r"\d+", s or "0"))
+
+
+def latest_release():
+    """Тег последнего релиза на GitHub без 'v'. Ошибка сети -> исключение."""
+    req = urllib.request.Request("https://api.github.com/repos/%s/releases/latest" % REPO,
+                                 headers={"Accept": "application/vnd.github+json", "User-Agent": "vpn-kit"})
+    with urllib.request.urlopen(req, timeout=15) as r:
+        return (json.loads(r.read()).get("tag_name") or "").lstrip("v")
+
+
+def check_update():
+    """Записать CFG['update_available'] = тег, если на GitHub версия новее установленной. -> тег|None."""
+    try:
+        latest = latest_release()
+    except Exception:
+        return CFG.get("update_available")
+    nv = latest if latest and ver_tuple(latest) > ver_tuple(kit_option("KIT_VERSION", "0")) else None
+    if CFG.get("update_available") != nv:
+        CFG["update_available"] = nv
+        save_cfg()
+    return nv
+
+
+def http_bytes(url):
+    req = urllib.request.Request(url, headers={"User-Agent": "vpn-kit"})
+    with urllib.request.urlopen(req, timeout=60) as r:
+        return r.read()
+
+
+def do_update(chat):
+    import hashlib
+    send(chat, "⏳ Скачиваю последнюю версию установщика…")
+    try:
+        script = http_bytes(INSTALLER_URL)
+        want = http_bytes(INSTALLER_URL + ".sha256").decode().split()[0]
+    except Exception as ex:
+        send(chat, "❌ Не удалось скачать: %s" % e(str(ex)), [BACK])
+        return
+    got = hashlib.sha256(script).hexdigest()
+    if got != want:
+        send(chat, "❌ Контрольная сумма не совпала — обновление отменено.\nОжидалось %s, получено %s"
+             % (want[:16], got[:16]), [BACK])
+        return
+    tmp = "/tmp/vpn-kit-update.sh"
+    with open(tmp, "wb") as f:
+        f.write(script)
+    ver = CFG.get("update_available") or "?"
+    with open(UPDATE_SENTINEL, "w", encoding="utf-8") as f:
+        f.write(ver)
+    send(chat, "✅ Контрольная сумма верна. Запускаю обновление до <b>%s</b>.\n"
+               "Бот перезапустится, я пришлю подтверждение." % e(str(ver)))
+    # отдельный транзиентный юнит, чтобы обновление пережило перезапуск самого бота
+    rc, _, err = run(["systemd-run", "--unit=vpn-kit-update", "--collect", "bash", tmp])
+    if rc != 0:
+        os.remove(UPDATE_SENTINEL)
+        send(chat, "❌ Не удалось запустить обновление: %s" % e(err.strip()), [BACK])
+
+
 def delete_client(pub):
     with _awg_lock:
         conf = read_file(AWG_CONF)
@@ -634,10 +918,14 @@ def delete_client(pub):
             os.remove(conf_path(pub))
         except FileNotFoundError:
             pass
-    if pub in CFG.get("blocked", []) or pub in CFG.get("share_mute", {}):
+    if pub in CFG.get("blocked", []) or pub in CFG.get("share_mute", {}) or pub in CFG.get("clients", {}):
         CFG["blocked"] = [p for p in CFG.get("blocked", []) if p != pub]
         CFG.get("share_mute", {}).pop(pub, None)
+        CFG.get("clients", {}).pop(pub, None)
         save_cfg()
+    tr = load_traffic()
+    if tr.pop(pub, None) is not None:
+        save_traffic(tr)
         write_blocked_file()
 
 
@@ -880,6 +1168,47 @@ def ok_icon(b):
     return "🟢" if b else "🔴"
 
 
+def build_report():
+    """Короткая сводка для админов: сервер, клиенты, трафик за месяц, AdGuard."""
+    total, avail = meminfo()
+    disk = shutil.disk_usage("/")
+    with open("/proc/uptime") as f:
+        uptime = float(f.read().split()[0])
+    lines = ["<b>📈 Ежедневный отчёт</b> · %s" % today_str(),
+             "⏱ Аптайм %s · 💾 RAM %.0f%% · 💿 Диск %.0f%%" % (
+                 dur(uptime), 100.0 * (total - avail) / total, 100.0 * disk.used / disk.total)]
+    try:
+        cl = get_clients()
+        online = sum(1 for c in cl if c["hs"] and time.time() - c["hs"] < ONLINE_SEC)
+        blocked = sum(1 for c in cl if is_blocked(c["pub"]))
+        lines.append("👥 Клиентов: %d (онлайн %d, отключены %d)" % (len(cl), online, blocked))
+        tr = load_traffic()
+        top = sorted(cl, key=lambda c: used_bytes(c["pub"], tr), reverse=True)
+        top = [c for c in top if used_bytes(c["pub"], tr) > 0][:5]
+        if top:
+            lines.append("\n<b>Трафик за месяц (топ):</b>")
+            for c in top:
+                cd = cdata(c["pub"])
+                lim = " / %d ГБ" % cd["limit_gb"] if cd.get("limit_gb") else ""
+                lines.append("  • %s — %s%s" % (e(c["name"]), hb(used_bytes(c["pub"], tr)), lim))
+        soon = [c for c in cl if cdata(c["pub"]).get("expires")
+                and cdata(c["pub"])["expires"] <= time.strftime("%Y-%m-%d", time.localtime(time.time() + 3 * 86400))]
+        if soon:
+            lines.append("\n<b>⏳ Скоро истекает срок:</b>")
+            for c in soon:
+                lines.append("  • %s — до %s" % (e(c["name"]), cdata(c["pub"])["expires"]))
+    except Exception as ex:
+        lines.append("👥 Клиенты: ошибка (%s)" % e(str(ex)))
+    try:
+        s = ag("GET", "/control/stats")
+        q, bl = s.get("num_dns_queries", 0), s.get("num_blocked_filtering", 0)
+        lines.append("\n🛡 AdGuard за 7 дней: запросов %d, заблокировано %d (%.0f%%)" % (
+            q, bl, 100.0 * bl / q if q else 0))
+    except Exception:
+        pass
+    return "\n".join(lines)
+
+
 def view_status():
     with open("/proc/uptime") as f:
         uptime = float(f.read().split()[0])
@@ -956,12 +1285,25 @@ def view_client(pub):
         return "Клиент не найден (возможно, уже удалён).", [[btn("⬅️ К списку", "clients")]]
     ep = c["endpoint"]
     blocked = is_blocked(pub)
-    lines = ["<b>👤 %s</b>%s" % (e(c["name"]), "  ⛔ <b>ОТКЛЮЧЁН</b>" if blocked else ""),
+    cd = cdata(pub)
+    off = cd.get("auto_off")
+    status = {"expired": "  ⛔ <b>СРОК ИСТЁК</b>", "limit": "  ⛔ <b>ЛИМИТ ИСЧЕРПАН</b>"}.get(
+        off, "  ⛔ <b>ОТКЛЮЧЁН</b>" if blocked else "")
+    used = used_bytes(pub)
+    lim = cd.get("limit_gb")
+    if lim:
+        left = max(0, lim * GB - used)
+        traf = "Трафик за месяц: %s из %d ГБ (осталось %s)" % (hb(used), lim, hb(left))
+    else:
+        traf = "Трафик за месяц: %s (лимит не задан)" % hb(used)
+    exp = cd.get("expires")
+    srok = ("Срок действия: до %s%s" % (exp, " ⚠️" if is_expired(cd) else "")) if exp else "Срок действия: бессрочно"
+    lines = ["<b>👤 %s</b>%s" % (e(c["name"]), status),
              "IP в VPN: <code>%s</code>" % c["ip"],
              "Создан: %s" % e(c["created"] or "—"),
              "Последнее подключение: %s" % ago(c["hs"]),
              "Откуда: <code>%s</code>" % e(ep.rsplit(":", 1)[0]) if ep and ep != "(none)" else "Откуда: —",
-             "Трафик (с запуска VPN): ⬇️ %s ⬆️ %s" % (hb(c["tx"]), hb(c["rx"])),
+             traf, srok,
              "Ключ: <code>%s</code>" % e(c["pub"])]
     kb = []
     try:
@@ -978,6 +1320,11 @@ def view_client(pub):
         lines.append("\n<i>Конфиг этого клиента создан в приложении Amnezia — у бота его нет.</i>")
     if c["has_conf"]:
         kb.append([btn("📄 Конфиг + QR", "cconf:" + pub)])
+    kb.append([btn("⏳ Срок", "cexp:" + pub), btn("📊 Лимит", "clim:" + pub)])
+    if off == "expired":
+        kb.append([btn("➕ Продлить 30 дней", "cext:" + pub)])
+    if off == "limit":
+        kb.append([btn("♻️ Сбросить лимит", "clrst:" + pub)])
     kb.append([btn("🔑 Новый ключ", "crk:" + pub),
                btn("✅ Включить" if blocked else "⛔ Отключить", ("cunb:" if blocked else "cblk:") + pub)])
     kb.append([btn("🗑 Удалить", "cdel:" + pub)])
@@ -1049,11 +1396,23 @@ def view_ru():
     return "\n".join(lines), kb
 
 
+REPORT_LABELS = {"daily": "ежедневно", "weekly": "еженедельно (пн)", "off": "выключен"}
+
+
 def view_service():
+    mode = CFG.get("report", "daily")
+    ver = kit_option("KIT_VERSION", "?")
+    nv = CFG.get("update_available")
     text = ("<b>⚙️ Сервис</b>\n\n"
+            "Версия набора: <b>%s</b>%s\n"
+            "Ежедневный отчёт: <b>%s</b>\n\n"
             "• Перезапуск VPN — клиенты переподключатся автоматически (~10 сек).\n"
-            "• Перезагрузка сервера — VPN недоступен ~1 мин.")
-    kb = [[btn("🔄 Перезапустить VPN", "ask:rvpn")],
+            "• Перезагрузка сервера — VPN недоступен ~1 мин." % (
+                e(str(ver)), ("\n⬆️ Доступна версия <b>%s</b>" % e(str(nv)) if nv else ""), REPORT_LABELS[mode]))
+    kb = [[btn("💾 Бэкап в Telegram", "backup")],
+          [btn("⬆️ Обновить набор" if nv else "⬆️ Проверить обновления", "update")],
+          [btn("📈 Отчёт: %s" % REPORT_LABELS[mode], "reptgl")],
+          [btn("🔄 Перезапустить VPN", "ask:rvpn")],
           [btn("🔄 Перезапустить AdGuard", "ask:rag")],
           [btn("♻️ Перезагрузить сервер", "ask:reboot")],
           BACK]
@@ -1084,6 +1443,55 @@ def do_add(chat, name):
     ag_sync()
     send_client_conf(chat, name, r["ip"], r["conf"], created=True)
     send(chat, *view_menu())
+
+
+def parse_date(s):
+    """'ГГГГ-ММ-ДД', 'ДД.ММ.ГГГГ', 'ДД.ММ.ГГ' или '+N' (дней) -> 'ГГГГ-ММ-ДД'. Ошибка -> ValueError."""
+    s = s.strip()
+    if re.fullmatch(r"\+?\d{1,4}", s) and s.startswith("+"):
+        return time.strftime("%Y-%m-%d", time.localtime(time.time() + int(s[1:]) * 86400))
+    for fmt in ("%Y-%m-%d", "%d.%m.%Y", "%d.%m.%y"):
+        try:
+            return time.strftime("%Y-%m-%d", time.strptime(s, fmt))
+        except ValueError:
+            continue
+    raise ValueError("не дата")
+
+
+def do_set_limit(chat, kind, pub, text):
+    c = find_client(pub)
+    if not c:
+        send(chat, "Клиент не найден (возможно, удалён).", [[btn("⬅️ К списку", "clients")]])
+        return
+    try:
+        if kind == "exp":
+            if text.strip() == "0":
+                set_cdata(pub, expires=None, warned=None)
+                msg = "✅ Срок действия снят — клиент бессрочный."
+            else:
+                d = parse_date(text)
+                if d <= today_str():
+                    send(chat, "Дата уже прошла. Отправьте будущую дату или /cancel."); return
+                set_cdata(pub, expires=d, warned=None)
+                msg = "✅ Срок действия: до <b>%s</b>." % d
+        else:
+            gb = int(re.sub(r"[^\d]", "", text) or "-1")
+            if gb < 0:
+                send(chat, "Нужно число гигабайт (например 50) или 0. /cancel — отмена."); return
+            set_cdata(pub, limit_gb=gb or None)
+            msg = "✅ Лимит снят." if gb == 0 else "✅ Месячный лимит: <b>%d ГБ</b>." % gb
+    except ValueError:
+        send(chat, "Не понял. Срок: <code>ГГГГ-ММ-ДД</code> или <code>+30</code>. "
+                   "Лимит: число ГБ. <code>0</code> — снять. /cancel — отмена."); return
+    # если ограничение сняли/ослабили и клиент был отключён автоматически — вернуть доступ
+    cd = cdata(pub)
+    if cd.get("auto_off") and not is_expired(cd) and not is_over_limit(cd, used_bytes(pub)):
+        set_cdata(pub, auto_off=None)
+        if is_blocked(pub):
+            set_blocked(pub, False)
+        msg += " Доступ восстановлен."
+    send(chat, msg)
+    send(chat, *view_client(pub))
 
 
 def send_client_conf(chat, name, ip, conf, created=False):
@@ -1159,12 +1567,51 @@ def handle_callback(cq):
         elif data.startswith("cblkok:"):
             pub = data[7:]
             wait("Отключаю…")
+            set_cdata(pub, auto_off=None)       # ручное отключение «берёт верх» над автоматикой
             set_blocked(pub, True)
             show(view_client(pub))
         elif data.startswith("cunb:"):
             pub = data[5:]
             wait("Включаю…")
+            set_cdata(pub, auto_off=None, warned=None)
             set_blocked(pub, False)
+            show(view_client(pub))
+        elif data.startswith("cexp:"):      # задать срок действия (текстом)
+            pub = data[5:]
+            pending[chat] = "exp:" + pub
+            c = find_client(pub)
+            cur = cdata(pub).get("expires")
+            show(("⏳ Срок действия для <b>%s</b>\n\nОтправьте дату в формате <code>ГГГГ-ММ-ДД</code> "
+                  "или число дней (<code>+30</code>). Сейчас: %s\n<code>0</code> — сделать бессрочным. /cancel — отмена"
+                  % (e(c["name"] if c else "?"), cur or "бессрочно"), [[btn("⬅️ Отмена", "c:" + pub)]]))
+        elif data.startswith("clim:"):      # задать месячный лимит (текстом)
+            pub = data[5:]
+            pending[chat] = "lim:" + pub
+            c = find_client(pub)
+            cur = cdata(pub).get("limit_gb")
+            show(("📊 Месячный лимит трафика для <b>%s</b>\n\nОтправьте число гигабайт (например <code>50</code>). "
+                  "Сейчас: %s\n<code>0</code> — без лимита. /cancel — отмена"
+                  % (e(c["name"] if c else "?"), ("%d ГБ" % cur) if cur else "без лимита"),
+                  [[btn("⬅️ Отмена", "c:" + pub)]]))
+        elif data.startswith("cext:"):      # продлить на 30 дней от сегодня/текущего срока
+            pub = data[5:]
+            wait("Продлеваю…")
+            base = max(today_str(), cdata(pub).get("expires") or today_str())
+            bt = time.strptime(base, "%Y-%m-%d")
+            new = time.strftime("%Y-%m-%d", time.localtime(time.mktime(bt) + 30 * 86400))
+            set_cdata(pub, expires=new, warned=None)
+            send(chat, "✅ Срок продлён до <b>%s</b>." % new)
+            show(view_client(pub))
+        elif data.startswith("clrst:"):     # сбросить месячный лимит
+            pub = data[6:]
+            wait("Сбрасываю лимит…")
+            tr = load_traffic()
+            if tr.pop(pub, None) is not None:
+                save_traffic(tr)
+            set_cdata(pub, auto_off=None)
+            if is_blocked(pub):
+                set_blocked(pub, False)
+            send(chat, "✅ Счётчик трафика за месяц сброшен, доступ восстановлен.")
             show(view_client(pub))
         elif data.startswith("shign:"):
             pub = data[6:]
@@ -1249,6 +1696,28 @@ def handle_callback(cq):
             show(view_ru())
         elif data == "service":
             show(view_service())
+        elif data == "reptgl":
+            order = ["daily", "weekly", "off"]
+            cur = CFG.get("report", "daily")
+            CFG["report"] = order[(order.index(cur) + 1) % 3]
+            save_cfg()
+            show(view_service())
+        elif data == "backup":
+            do_backup(chat)
+            show(view_service())
+        elif data == "update":
+            wait("Проверяю обновления…")
+            nv = check_update()
+            if not nv:
+                show(("✅ Установлена последняя версия (%s)." % e(kit_option("KIT_VERSION", "?")),
+                      [[btn("⬅️ Сервис", "service")], BACK]))
+            else:
+                show(("⬆️ Доступна версия <b>%s</b> (у вас %s).\n\nОбновление скачает установщик, проверит "
+                      "контрольную сумму и перезапустит сервисы. Клиенты, настройки и параметры сохранятся."
+                      % (e(str(nv)), e(kit_option("KIT_VERSION", "?"))),
+                      [[btn("⬆️ Обновить сейчас", "doupd"), btn("❌ Отмена", "service")]]))
+        elif data == "doupd":
+            do_update(chat)
         elif data.startswith("ask:"):
             act = data[4:]
             back = "adguard" if act == "rag" else "service"
@@ -1296,6 +1765,12 @@ def handle_message(m):
     if pending.get(chat) == "add_name" and text and not text.startswith("/"):
         pending.pop(chat, None)
         do_add(chat, text)
+        return
+
+    pend = pending.get(chat, "")
+    if pend.startswith(("exp:", "lim:")) and text and not text.startswith("/"):
+        pending.pop(chat, None)
+        do_set_limit(chat, pend[:3], pend[4:], text)
         return
 
     cmd = text.split()[0].split("@")[0].lower() if text else ""
@@ -1346,6 +1821,7 @@ def monitor():
     cont = {}
     flags = {"disk": False, "mem": False, "reboot": False}
     seen = None   # pub -> был ли когда-либо handshake
+    last_report = today_str()   # при старте не слать отчёт за «сегодня»
     titles = {AWG_CONTAINER: "VPN (AmneziaWG)", ADGUARD_CONTAINER: "AdGuard Home"}
     while True:
         alerts = []
@@ -1386,12 +1862,30 @@ def monitor():
             if container_state(AWG_CONTAINER)[0]:
                 write_blocked_file()
                 enforce_blocked()
+                check_access(account_traffic())   # сроки и лимиты
                 cl = get_clients()
                 if seen is not None:
                     for c in cl:
                         if c["hs"] and not seen.get(c["pub"]):
                             alerts.append("🆕 Клиент <b>%s</b> подключился впервые" % e(c["name"]))
                 seen = {c["pub"]: bool(c["hs"]) or (seen or {}).get(c["pub"], False) for c in cl}
+
+            # раз в день в REPORT_HOUR: отчёт (если включён) и проверка обновлений
+            now = time.localtime()
+            if now.tm_hour >= REPORT_HOUR and today_str() != last_report:
+                last_report = today_str()
+                mode = CFG.get("report", "daily")
+                if mode != "off" and (mode == "daily" or now.tm_wday == 0):
+                    try:
+                        notify_admins(build_report())
+                    except Exception:
+                        log("report:", traceback.format_exc())
+                prev_nv = CFG.get("update_available")
+                nv = check_update()
+                if nv and nv != prev_nv:
+                    notify_admins("⬆️ Доступна новая версия набора: <b>%s</b> (у вас %s). "
+                                  "Обновить: ⚙️ Сервис → «Обновить набор»." % (
+                                      e(str(nv)), e(kit_option("KIT_VERSION", "?"))))
         except Exception:
             log("monitor:", traceback.format_exc())
         if alerts:
@@ -1481,6 +1975,17 @@ def main():
         time.sleep(60)
         raise SystemExit(1)
     log("started as @%s, admins: %s" % (me["result"]["username"], sorted(ADMINS) or "нет (ожидается /start <код>)"))
+    # сообщить об успешном обновлении (установщик перезапустил бота)
+    if os.path.exists(UPDATE_SENTINEL):
+        try:
+            with open(UPDATE_SENTINEL, encoding="utf-8") as f:
+                ver = f.read().strip()
+            os.remove(UPDATE_SENTINEL)
+            CFG["update_available"] = None
+            save_cfg()
+            notify_admins("✅ Набор обновлён. Текущая версия: <b>%s</b>." % e(kit_option("KIT_VERSION", ver)))
+        except Exception:
+            log("update sentinel:", traceback.format_exc())
     tg("setMyCommands", {"commands": [
         {"command": "menu", "description": "Главное меню"},
         {"command": "status", "description": "Состояние сервера"},

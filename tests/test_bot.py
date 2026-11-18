@@ -76,8 +76,10 @@ class FakeAwg(unittest.TestCase):
         self.patch("AG_STATE", os.path.join(self.tmp, "adguard-clients.json"))
         self.patch("AG_LOCK", os.path.join(self.tmp, "adguard.lock"))
         self.patch("KIT_OPTIONS", os.path.join(self.tmp, "options"))
+        self.patch("TRAFFIC_PATH", os.path.join(self.tmp, "traffic.json"))
         bot.CFG.pop("blocked", None)
         bot.CFG.pop("share_mute", None)
+        bot.CFG.pop("clients", None)
 
     def tearDown(self):
         for k, v in self._saved.items():
@@ -168,6 +170,86 @@ class ClientOpsTest(FakeAwg):
     def test_delete_unknown_raises(self):
         with self.assertRaises(RuntimeError):
             bot.delete_client("ZZZZ")
+
+    def test_rekey_carries_expiry_limit_and_traffic(self):
+        bot.CFG.setdefault("clients", {})["AAAA"] = {"expires": "2030-01-01", "limit_gb": 50}
+        bot.save_traffic({"AAAA": {"month": bot.cur_month(), "rx": 100, "tx": 200,
+                                   "last_rx": 100, "last_tx": 200}})
+        bot.rekey_client("AAAA")
+        self.assertNotIn("AAAA", bot.CFG["clients"])
+        self.assertEqual(bot.CFG["clients"]["NEW1"]["limit_gb"], 50)
+        tr = bot.load_traffic()
+        self.assertNotIn("AAAA", tr)
+        self.assertEqual(tr["NEW1"]["rx"], 100)
+
+    def test_delete_clears_client_data_and_traffic(self):
+        bot.CFG.setdefault("clients", {})["AAAA"] = {"limit_gb": 10}
+        bot.save_traffic({"AAAA": {"month": bot.cur_month(), "rx": 1, "tx": 2,
+                                   "last_rx": 1, "last_tx": 2}})
+        bot.delete_client("AAAA")
+        self.assertNotIn("AAAA", bot.CFG.get("clients", {}))
+        self.assertNotIn("AAAA", bot.load_traffic())
+
+
+class TrafficTest(unittest.TestCase):
+    def test_account_delta_normal(self):
+        self.assertEqual(bot.account_delta(100, 250), 150)
+        self.assertEqual(bot.account_delta(0, 0), 0)
+
+    def test_account_delta_counter_reset(self):
+        # счётчик обнулился (перезапуск контейнера): cur < prev -> прирост = cur
+        self.assertEqual(bot.account_delta(5000, 30), 30)
+
+    def test_roll_month_first_reading_starts_at_zero(self):
+        e = bot.roll_month(None, "2026-11", 1000, 2000)
+        self.assertEqual((e["rx"], e["tx"]), (0, 0))
+        self.assertEqual((e["last_rx"], e["last_tx"]), (1000, 2000))
+
+    def test_roll_month_accumulates(self):
+        e = bot.roll_month(None, "2026-11", 1000, 2000)
+        e = bot.roll_month(e, "2026-11", 1500, 2500)
+        self.assertEqual((e["rx"], e["tx"]), (500, 500))
+        e = bot.roll_month(e, "2026-11", 1600, 2600)
+        self.assertEqual((e["rx"], e["tx"]), (600, 600))
+
+    def test_roll_month_handles_reset(self):
+        e = {"month": "2026-11", "rx": 500, "tx": 500, "last_rx": 1500, "last_tx": 2500}
+        e = bot.roll_month(e, "2026-11", 40, 60)   # контейнер перезапущен, счётчики с нуля
+        self.assertEqual((e["rx"], e["tx"]), (540, 560))
+
+    def test_roll_month_new_month_resets(self):
+        e = {"month": "2026-11", "rx": 999, "tx": 999, "last_rx": 10, "last_tx": 10}
+        e = bot.roll_month(e, "2026-12", 10, 10)
+        self.assertEqual((e["rx"], e["tx"]), (0, 0))
+
+
+class DateTest(unittest.TestCase):
+    def test_parse_date_formats(self):
+        self.assertEqual(bot.parse_date("2026-12-31"), "2026-12-31")
+        self.assertEqual(bot.parse_date("31.12.2026"), "2026-12-31")
+        self.assertEqual(bot.parse_date("01.02.27"), "2027-02-01")
+
+    def test_parse_date_relative(self):
+        import time as _t
+        want = _t.strftime("%Y-%m-%d", _t.localtime(_t.time() + 30 * 86400))
+        self.assertEqual(bot.parse_date("+30"), want)
+
+    def test_parse_date_invalid(self):
+        for bad in ("завтра", "32.13.2026", "", "-5"):
+            with self.assertRaises(ValueError):
+                bot.parse_date(bad)
+
+
+class AccessLogicTest(unittest.TestCase):
+    def test_is_expired(self):
+        self.assertTrue(bot.is_expired({"expires": "2000-01-01"}))
+        self.assertFalse(bot.is_expired({"expires": "2999-01-01"}))
+        self.assertFalse(bot.is_expired({}))
+
+    def test_is_over_limit(self):
+        self.assertTrue(bot.is_over_limit({"limit_gb": 1}, 2 * bot.GB))
+        self.assertFalse(bot.is_over_limit({"limit_gb": 10}, 2 * bot.GB))
+        self.assertFalse(bot.is_over_limit({}, 999 * bot.GB))
 
 
 class ClientConfTest(unittest.TestCase):

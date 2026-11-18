@@ -20,7 +20,7 @@ KIT_VERSION="1.1"
 AG_IP=172.29.172.253
 OPTIONS_FILE=/etc/vpn-kit/options
 
-TOKEN=""; RU_BLOCK=1; RU_DNS=1; ADGUARD=1; AUTO_REBOOT=1; BOT=1; UNINSTALL=0; YES=0
+TOKEN=""; RU_BLOCK=1; RU_DNS=1; ADGUARD=1; AUTO_REBOOT=1; BOT=1; UNINSTALL=0; YES=0; RESTORE=""; RESTORE_PASS=""
 
 # Параметры прошлой установки: повторный запуск (обновление) их не сбрасывает
 if [ -r "$OPTIONS_FILE" ]; then
@@ -43,6 +43,8 @@ usage() { cat <<'EOF'
   --no-auto-reboot    не перезагружать сервер ночью после обновлений ядра
   --no-bot            не ставить Telegram-бота
   --uninstall         удалить VPN Server Kit (AmneziaWG и клиенты остаются)
+  --restore <файл>    восстановить из зашифрованного бэкапа бота (переезд на новый сервер)
+  --pass <пароль>     пароль бэкапа для --restore (иначе спросит)
   -y, --yes           не спрашивать подтверждение (для --uninstall)
   -h, --help          эта справка
 
@@ -65,6 +67,8 @@ while [ $# -gt 0 ]; do
     --auto-reboot)    AUTO_REBOOT=1; shift ;;
     --bot)            BOT=1; shift ;;
     --uninstall)      UNINSTALL=1; shift ;;
+    --restore)        RESTORE="${2:-}"; shift 2 ;;
+    --pass)           RESTORE_PASS="${2:-}"; shift 2 ;;
     -y|--yes)         YES=1; shift ;;
     -h|--help)        usage; exit 0 ;;
     *) echo "Неизвестный параметр: $1"; echo; usage; exit 1 ;;
@@ -203,6 +207,12 @@ setup_adguard() {
     -v /opt/adguardhome/work:/opt/adguardhome/work \
     -v /opt/adguardhome/conf:/opt/adguardhome/conf \
     adguard/adguardhome:latest >/dev/null
+  # восстановленный из бэкапа AdGuard уже настроен — не трогаем конфигурацию
+  if [ -f /opt/adguardhome/conf/AdGuardHome.yaml ] && [ -f /root/adguard-admin.txt ]; then
+    for _ in $(seq 1 60); do curl -fs -o /dev/null -u "admin:$(sed -n 's/^Password: //p' /root/adguard-admin.txt)" "http://$AG_IP/control/status" && break; sleep 1; done
+    ok "восстановлен из бэкапа — настройки и пароль сохранены"
+    return 0
+  fi
   local pass
   for _ in $(seq 1 60); do curl -fs -o /dev/null "http://$AG_IP:3000/control/install/get_addresses" && break; sleep 1; done
   pass=$(python3 -c 'import secrets, string; print("".join(secrets.choice(string.ascii_letters + string.digits) for _ in range(20)))')
@@ -399,9 +409,45 @@ EOF
   echo
 }
 
+restore() {
+  say "Восстановление из бэкапа"
+  [ "$(id -u)" = 0 ] || die "Запустите от root (sudo -i)"
+  [ -f "$RESTORE" ] || die "Файл бэкапа не найден: $RESTORE"
+  command -v openssl >/dev/null || { apt-get update -q >/dev/null 2>&1; apt-get install -y -q openssl >/dev/null 2>&1; }
+  command -v openssl >/dev/null || die "Не найден openssl для расшифровки"
+  local pass="$RESTORE_PASS"
+  if [ -z "$pass" ]; then
+    printf '   Пароль бэкапа (его показал бот при первом бэкапе): '
+    read -rs pass </dev/tty 2>/dev/null || die "Пароль не задан. Повторите с --pass <пароль>"
+    echo
+  fi
+  [ -n "$pass" ] || die "Пустой пароль"
+  # проверяем пароль и распаковываем во временную папку, затем переносим в /
+  local tmp; tmp=$(mktemp -d)
+  if ! VPNKIT_P="$pass" openssl enc -d -aes-256-cbc -pbkdf2 -pass env:VPNKIT_P -in "$RESTORE" 2>/dev/null \
+       | tar xzf - -C "$tmp" 2>/dev/null; then
+    rm -rf "$tmp"; die "Не удалось расшифровать — неверный пароль или повреждённый файл"
+  fi
+  [ -d "$tmp/etc/vpn-bot" ] || { rm -rf "$tmp"; die "В архиве нет данных бота — это не бэкап VPN Server Kit"; }
+  cp -a "$tmp/." / 2>/dev/null || true
+  rm -rf "$tmp"
+  ok "файлы бэкапа восстановлены (клиенты, ключи, настройки AdGuard и бота)"
+  # восстановленные параметры установки учитываем дальше
+  if [ -r "$OPTIONS_FILE" ]; then
+    local k v
+    while IFS='=' read -r k v; do
+      case "$k" in RU_BLOCK|RU_DNS|ADGUARD|AUTO_REBOOT|BOT) [[ "$v" =~ ^[01]$ ]] && printf -v "$k" '%s' "$v" ;; esac
+    done < "$OPTIONS_FILE"
+  fi
+}
+
 if [ "$UNINSTALL" = 1 ]; then
   uninstall
   exit 0
+fi
+
+if [ -n "$RESTORE" ]; then
+  restore
 fi
 
 detect
