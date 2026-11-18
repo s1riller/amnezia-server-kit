@@ -1229,7 +1229,11 @@ MAIN_KB = [[btn("📊 Статус", "status"), btn("👥 Клиенты", "clie
 
 
 def view_menu():
-    return "<b>🛡 Панель VPN-сервера</b>\nВыберите раздел:", MAIN_KB
+    kb = [row[:] for row in MAIN_KB]
+    n = len(CFG.get("requests", {}))
+    if n:
+        kb = [[btn("📨 Заявки на доступ (%d)" % n, "reqs")]] + kb
+    return "<b>🛡 Панель VPN-сервера</b>\nВыберите раздел:", kb
 
 
 def ok_icon(b):
@@ -1495,6 +1499,117 @@ CONFIRM = {"rvpn": "Перезапустить контейнер VPN?",
            "reboot": "Перезагрузить сервер? VPN будет недоступен около минуты."}
 
 
+# ====================== заявки на доступ и кабинет пользователя ======================
+REQ_REALERT = 3600   # не чаще раза в час напоминать админам об одной и той же заявке
+
+
+def client_owned_by(uid):
+    for c in get_clients():
+        if cdata(c["pub"]).get("owner") == uid:
+            return c
+    return None
+
+
+def add_request(uid, name, username):
+    reqs = CFG.setdefault("requests", {})
+    r = reqs.get(str(uid))
+    now = int(time.time())
+    if r and now - r.get("ts", 0) < REQ_REALERT:
+        return False   # уже есть свежая заявка — не спамим админов
+    reqs[str(uid)] = {"name": name, "username": username, "ts": now}
+    save_cfg()
+    return True
+
+
+def notify_request(uid):
+    r = CFG.get("requests", {}).get(str(uid), {})
+    who = e(r.get("name") or "без имени")
+    un = (" (@%s)" % e(r["username"])) if r.get("username") else ""
+    txt = "📨 <b>Заявка на доступ к VPN</b>\nОт: %s%s\nID: <code>%s</code>" % (who, un, uid)
+    kb = [[btn("✅ Одобрить", "ap:%s" % uid), btn("🚫 Отклонить", "rej:%s" % uid)]]
+    for a in ADMINS:
+        send(a, txt, kb)
+
+
+def view_reqs():
+    reqs = CFG.get("requests", {})
+    if not reqs:
+        return "📨 <b>Заявки на доступ</b>\n\nНовых заявок нет.", [BACK]
+    lines = ["📨 <b>Заявки на доступ (%d)</b>" % len(reqs), ""]
+    kb = []
+    for uid, r in sorted(reqs.items(), key=lambda kv: kv[1].get("ts", 0)):
+        un = (" @%s" % r["username"]) if r.get("username") else ""
+        lines.append("• %s%s — <code>%s</code>" % (e(r.get("name") or "без имени"), e(un), uid))
+        kb.append([btn("✅ %s" % (r.get("name") or uid)[:30], "ap:%s" % uid),
+                   btn("🚫", "rej:%s" % uid)])
+    kb.append(BACK)
+    return "\n".join(lines), kb
+
+
+APPROVE_TERMS = [("♾ Бессрочно", 0), ("30 дней", 30), ("90 дней", 90)]
+APPROVE_LIMITS = [("∞ Без лимита", 0), ("50 ГБ", 50), ("100 ГБ", 100)]
+
+
+def do_approve(uid, days, gb):
+    """Создать клиента по заявке, привязать к пользователю, выдать конфиг ему в личку."""
+    r = CFG.get("requests", {}).get(str(uid), {})
+    name = (r.get("name") or ("user%s" % uid)).strip()[:40]
+    res = create_client(name)
+    pub, ip = res["pub"], res["ip"]
+    kw = {"owner": uid}
+    if days:
+        kw["expires"] = time.strftime("%Y-%m-%d", time.localtime(time.time() + days * 86400))
+    if gb:
+        kw["limit_gb"] = gb
+    set_cdata(pub, **kw)
+    CFG.get("requests", {}).pop(str(uid), None)
+    save_cfg()
+    ag_sync()
+    # выдаём конфиг самому пользователю
+    send(uid, "✅ Вам одобрен доступ к VPN. Ниже — конфигурация для подключения.")
+    send_client_conf(uid, name, ip, res["conf"], created=False)
+    send(uid, *view_cabinet(uid))
+    return name, ip
+
+
+def view_cabinet(uid):
+    c = client_owned_by(uid)
+    if not c:
+        if str(uid) in CFG.get("requests", {}):
+            return ("⏳ Ваша заявка на доступ к VPN отправлена администратору. "
+                    "Как только её одобрят, я пришлю конфигурацию сюда.", None)
+        return ("👋 Здравствуйте! Чтобы получить доступ к VPN, нажмите кнопку ниже.",
+                [[btn("📨 Запросить доступ", "req")]])
+    pub = c["pub"]
+    cd = cdata(pub)
+    blocked = is_blocked(pub)
+    off = cd.get("auto_off")
+    used = used_bytes(pub)
+    lim = cd.get("limit_gb")
+    lines = ["<b>👤 Ваш VPN</b>"]
+    if off == "expired" or (not blocked and cd.get("expires") and is_expired(cd)):
+        lines.append("⛔ Срок действия истёк. Обратитесь к администратору.")
+    elif off == "limit":
+        lines.append("⛔ Исчерпан месячный лимит трафика. Возобновится в начале месяца.")
+    elif blocked:
+        lines.append("⛔ Доступ временно отключён администратором.")
+    else:
+        lines.append("🟢 Активен.")
+    if cd.get("expires"):
+        lines.append("Действует до: <b>%s</b>" % cd["expires"])
+    else:
+        lines.append("Срок: бессрочно")
+    if lim:
+        lines.append("Трафик за месяц: %s из %d ГБ (осталось %s)" % (hb(used), lim, hb(max(0, lim * GB - used))))
+    else:
+        lines.append("Трафик за месяц: %s" % hb(used))
+    kb = []
+    if c["has_conf"]:
+        kb.append([btn("📄 Моя конфигурация + QR", "myconf")])
+    kb.append([btn("🔄 Обновить", "my")])
+    return "\n".join(lines), kb
+
+
 # ====================== действия ======================
 pending = {}   # chat_id -> "add_name"
 
@@ -1592,7 +1707,7 @@ def handle_callback(cq):
     msg = cq.get("message") or {}
     chat, mid = msg.get("chat", {}).get("id"), msg.get("message_id")
     tg("answerCallbackQuery", {"callback_query_id": cq["id"]})
-    if uid not in ADMINS or chat is None:
+    if chat is None:
         return
 
     def show(view):
@@ -1600,6 +1715,30 @@ def handle_callback(cq):
 
     def wait(text):
         edit(chat, mid, "⏳ " + text)
+
+    if uid not in ADMINS:
+        # кабинет обычного пользователя — только свои кнопки
+        try:
+            if data == "req":
+                if client_owned_by(uid):
+                    show(view_cabinet(uid))
+                else:
+                    name = cq["from"].get("first_name") or cq["from"].get("username") or "без имени"
+                    if add_request(uid, name, cq["from"].get("username")):
+                        notify_request(uid)
+                    show(("✅ Заявка отправлена администратору. Я пришлю конфигурацию, как только её одобрят.", None))
+            elif data == "my":
+                show(view_cabinet(uid))
+            elif data == "myconf":
+                c = client_owned_by(uid)
+                if c and os.path.exists(conf_path(c["pub"])):
+                    with open(conf_path(c["pub"]), encoding="utf-8") as f:
+                        send_client_conf(uid, c["name"], c["ip"], f.read())
+                else:
+                    send(uid, "Конфигурация недоступна, обратитесь к администратору.")
+        except Exception:
+            log("user callback %s: %s" % (data, traceback.format_exc()))
+        return
 
     try:
         if data == "menu":
@@ -1695,6 +1834,46 @@ def handle_callback(cq):
                 set_blocked(pub, False)
             send(chat, "✅ Счётчик трафика за месяц сброшен, доступ восстановлен.")
             show(view_client(pub))
+        elif data == "reqs":
+            show(view_reqs())
+        elif data.startswith("ap:"):        # одобрение заявки: шаг 1 — срок
+            u = data[3:]
+            if str(u) not in CFG.get("requests", {}):
+                show(("Заявка уже обработана или отозвана.", [[btn("📨 Заявки", "reqs")], BACK]))
+            else:
+                r = CFG["requests"][str(u)]
+                show(("✅ Одобрить <b>%s</b> (ID <code>%s</code>)\n\nШаг 1 — срок действия:" % (
+                    e(r.get("name") or "без имени"), u),
+                    [[btn(t, "apt:%s:%d" % (u, d))] for t, d in APPROVE_TERMS] +
+                    [[btn("🚫 Отклонить", "rej:%s" % u), btn("⬅️ Заявки", "reqs")]]))
+        elif data.startswith("apt:"):       # шаг 2 — лимит
+            u, days = data[4:].split(":")
+            show(("✅ Одобрение <b>ID %s</b>, срок: %s.\n\nШаг 2 — месячный лимит трафика:" % (
+                u, dict((d, t) for t, d in APPROVE_TERMS).get(int(days), "?")),
+                [[btn(t, "apl:%s:%s:%d" % (u, days, g))] for t, g in APPROVE_LIMITS] +
+                [[btn("⬅️ Заявки", "reqs")]]))
+        elif data.startswith("apl:"):       # создать клиента и выдать конфиг
+            u, days, gb = data[4:].split(":")
+            if str(u) not in CFG.get("requests", {}):
+                show(("Заявка уже обработана.", [[btn("📨 Заявки", "reqs")], BACK]))
+            else:
+                wait("Создаю клиента и отправляю конфиг пользователю…")
+                try:
+                    name, ip = do_approve(int(u), int(days), int(gb))
+                    send(chat, "✅ Клиент <b>%s</b> создан (IP %s) и конфиг отправлен пользователю." % (e(name), ip))
+                except Exception as ex:
+                    log("approve:", traceback.format_exc())
+                    send(chat, "❌ Не удалось одобрить: %s" % e(str(ex)))
+                show(view_reqs())
+        elif data.startswith("rej:"):       # отклонить заявку
+            u = data[4:]
+            CFG.get("requests", {}).pop(str(u), None)
+            save_cfg()
+            try:
+                send(int(u), "🚫 Ваша заявка на доступ к VPN отклонена.")
+            except Exception:
+                pass
+            show(view_reqs())
         elif data.startswith("shign:"):
             pub = data[6:]
             CFG.setdefault("share_mute", {})[pub] = int(time.time()) + SHARE_MUTE
@@ -1845,8 +2024,16 @@ def handle_message(m):
             log("admin registered:", uid)
             send(chat, "✅ Вы зарегистрированы как администратор.")
             send(chat, *view_menu())
+            return
+        # обычный пользователь: личный кабинет или подача заявки на доступ
+        if client_owned_by(uid):
+            send(chat, *view_cabinet(uid))
+        elif str(uid) in CFG.get("requests", {}):
+            send(chat, "⏳ Ваша заявка уже на рассмотрении у администратора. Ожидайте.")
         else:
-            send(chat, "⛔ Нет доступа.\nВаш Telegram ID: <code>%s</code>" % uid)
+            send(chat, "👋 Здравствуйте! Этот бот выдаёт доступ к VPN. "
+                       "Нажмите кнопку, чтобы отправить заявку администратору.",
+                 [[btn("📨 Запросить доступ", "req")]])
         return
 
     if pending.get(chat) == "add_name" and text and not text.startswith("/"):

@@ -191,6 +191,48 @@ class ClientOpsTest(FakeAwg):
         self.assertNotIn("AAAA", bot.load_traffic())
 
 
+class RequestsTest(FakeAwg):
+    def setUp(self):
+        super().setUp()
+        self.patch("ag_sync", lambda: None)
+        self.sent = []
+        self.patch("send", lambda *a, **k: self.sent.append(a))
+        self.patch("send_file", lambda *a, **k: None)
+        self.patch("send_photo", lambda *a, **k: None)
+        bot.CFG.pop("requests", None)
+
+    def test_add_request_antispam(self):
+        self.assertTrue(bot.add_request(555, "Bob", "bob"))     # первая — принята
+        self.assertFalse(bot.add_request(555, "Bob", "bob"))    # свежая — админа не спамим
+        self.assertIn("555", bot.CFG["requests"])
+
+    def test_client_owned_by(self):
+        bot.set_cdata("AAAA", owner=777)
+        c = bot.client_owned_by(777)
+        self.assertIsNotNone(c)
+        self.assertEqual(c["pub"], "AAAA")
+        self.assertIsNone(bot.client_owned_by(888))
+
+    def test_do_approve_creates_owned_client_with_limits(self):
+        bot.CFG.setdefault("requests", {})["999"] = {"name": "Alice", "username": "alice", "ts": 0}
+        name, ip = bot.do_approve(999, 30, 50)
+        self.assertEqual(name, "Alice")
+        c = bot.client_owned_by(999)
+        self.assertIsNotNone(c)
+        cd = bot.cdata(c["pub"])
+        self.assertEqual(cd["owner"], 999)
+        self.assertEqual(cd["limit_gb"], 50)
+        self.assertGreater(cd["expires"], bot.today_str())
+        self.assertNotIn("999", bot.CFG.get("requests", {}))   # заявка снята
+
+    def test_do_approve_unlimited(self):
+        bot.CFG.setdefault("requests", {})["1000"] = {"name": "Bob", "username": "", "ts": 0}
+        bot.do_approve(1000, 0, 0)
+        cd = bot.cdata(bot.client_owned_by(1000)["pub"])
+        self.assertNotIn("expires", cd)
+        self.assertNotIn("limit_gb", cd)
+
+
 class TrafficTest(unittest.TestCase):
     def test_account_delta_normal(self):
         self.assertEqual(bot.account_delta(100, 250), 150)
