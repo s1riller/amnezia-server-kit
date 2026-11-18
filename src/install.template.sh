@@ -16,7 +16,7 @@
 #  Удаление:  bash install-vpn-kit.sh --uninstall
 # =====================================================================
 set -Eeuo pipefail
-KIT_VERSION="1.1"
+KIT_VERSION="1.2"
 AG_IP=172.29.172.253
 OPTIONS_FILE=/etc/vpn-kit/options
 

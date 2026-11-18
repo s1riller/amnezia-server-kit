@@ -17,6 +17,7 @@ import os
 import re
 import shutil
 import socket
+import struct
 import subprocess
 import threading
 import time
@@ -24,6 +25,7 @@ import traceback
 import urllib.error
 import urllib.request
 import uuid
+import zlib
 
 CONFIG_PATH = os.environ.get("VPN_BOT_CONFIG", "/etc/vpn-bot/config.json")
 KIT_OPTIONS = "/etc/vpn-kit/options"   # параметры установки (их учитывает повторный запуск установщика)
@@ -582,6 +584,72 @@ def save_client_conf(pub, text):
     with open(conf_path(pub), "w", encoding="utf-8") as f:
         f.write(text)
     os.chmod(conf_path(pub), 0o600)
+
+
+# ---------- родной конфиг AmneziaVPN (vpn://), с именем сервера ----------
+# Формат: "vpn://" + base64url(4 байта длины JSON (big-endian) + zlib(JSON)).
+# Имя, которое видит пользователь в приложении, — верхнее поле "description".
+SRV_NAME_DEFAULT = "AmneziaWG"
+AWG_OBFS = ["Jc", "Jmin", "Jmax", "S1", "S2", "S3", "S4", "H1", "H2", "H3", "H4", "I1"]
+
+
+def srv_name():
+    return (CFG.get("server_name") or "").strip() or SRV_NAME_DEFAULT
+
+
+def _conf_sections(conf_text):
+    iface, peer = {}, {}
+    for b in split_blocks(conf_text):
+        n = block_name(b)
+        if n == "Interface":
+            iface = dict(block_items(b))
+        elif n == "Peer":
+            peer = dict(block_items(b))
+    return iface, peer
+
+
+def build_vpn_uri(conf_text, name):
+    """Собрать vpn://-ссылку AmneziaVPN из текста клиентского .conf, с именем сервера name."""
+    iface, peer = _conf_sections(conf_text)
+    host, _, port = peer.get("Endpoint", "").rpartition(":")
+    dns = [d.strip() for d in iface.get("DNS", CLIENT_DNS).split(",") if d.strip()]
+    allowed = [a.strip() for a in peer.get("AllowedIPs", "0.0.0.0/0, ::/0").split(",") if a.strip()]
+    last = {
+        "allowed_ips": allowed,
+        "client_ip": iface.get("Address", "").split(",")[0].strip(),
+        "client_priv_key": iface.get("PrivateKey", ""),
+        "config": conf_text,
+        "hostName": host,
+        "mtu": iface.get("MTU", CLIENT_MTU),
+        "persistent_keep_alive": peer.get("PersistentKeepalive", "25"),
+        "port": int(port) if port.isdigit() else port,
+        "psk_key": peer.get("PresharedKey", ""),
+        "server_pub_key": peer.get("PublicKey", ""),
+    }
+    for k in AWG_OBFS:
+        if k in iface:
+            last[k] = iface[k]
+    awg = {"isThirdPartyConfig": True, "last_config": json.dumps(last, ensure_ascii=False),
+           "port": str(port), "transport_proto": "udp"}
+    outer = {
+        "containers": [{"awg": awg, "container": "amnezia-awg"}],
+        "defaultContainer": "amnezia-awg",
+        "description": name,
+        "dns1": dns[0] if dns else "1.1.1.1",
+        "dns2": dns[1] if len(dns) > 1 else "1.0.0.1",
+        "hostName": host,
+    }
+    js = json.dumps(outer, ensure_ascii=False).encode()
+    blob = struct.pack(">I", len(js)) + zlib.compress(js, 9)
+    return "vpn://" + base64.urlsafe_b64encode(blob).decode().rstrip("=")
+
+
+def decode_vpn_uri(uri):
+    """Обратное преобразование (для тестов и самопроверки)."""
+    raw = uri[len("vpn://"):]
+    raw += "=" * (-len(raw) % 4)
+    blob = base64.urlsafe_b64decode(raw)
+    return json.loads(zlib.decompress(blob[4:]).decode())
 
 
 def peer_ip(peer):
@@ -1405,11 +1473,14 @@ def view_service():
     nv = CFG.get("update_available")
     text = ("<b>⚙️ Сервис</b>\n\n"
             "Версия набора: <b>%s</b>%s\n"
+            "Имя сервера (для AmneziaVPN): <b>%s</b>\n"
             "Ежедневный отчёт: <b>%s</b>\n\n"
             "• Перезапуск VPN — клиенты переподключатся автоматически (~10 сек).\n"
             "• Перезагрузка сервера — VPN недоступен ~1 мин." % (
-                e(str(ver)), ("\n⬆️ Доступна версия <b>%s</b>" % e(str(nv)) if nv else ""), REPORT_LABELS[mode]))
-    kb = [[btn("💾 Бэкап в Telegram", "backup")],
+                e(str(ver)), ("\n⬆️ Доступна версия <b>%s</b>" % e(str(nv)) if nv else ""),
+                e(srv_name()), REPORT_LABELS[mode]))
+    kb = [[btn("✏️ Имя сервера", "srvname")],
+          [btn("💾 Бэкап в Telegram", "backup")],
           [btn("⬆️ Обновить набор" if nv else "⬆️ Проверить обновления", "update")],
           [btn("📈 Отчёт: %s" % REPORT_LABELS[mode], "reptgl")],
           [btn("🔄 Перезапустить VPN", "ask:rvpn")],
@@ -1495,13 +1566,24 @@ def do_set_limit(chat, kind, pub, text):
 
 
 def send_client_conf(chat, name, ip, conf, created=False):
+    sn = srv_name()
     cap = ("✅ Клиент <b>%s</b> создан, IP %s\n\n" % (e(name), ip) if created else "📄 <b>%s</b>\n\n" % e(name)) + \
           ("Как подключиться: установите <b>AmneziaVPN</b> (или AmneziaWG) → «+» → "
            "«Файл с настройками» и выберите этот файл, либо отсканируйте QR-код ниже.")
     send_file(chat, conf_filename(name, ip), conf.encode(), cap)
     png = qr_png(conf)
     if png:
-        send_photo(chat, png, "QR-код для «%s»" % e(name))
+        send_photo(chat, png, "QR-код (AmneziaWG / ручной импорт) — «%s»" % e(name))
+    # Ссылка/QR для AmneziaVPN: сервер отобразится под именем sn
+    try:
+        uri = build_vpn_uri(conf, sn)
+        png2 = qr_png(uri)
+        if png2:
+            send_photo(chat, png2, "QR для AmneziaVPN — сервер «%s»" % e(sn))
+        send(chat, "Ссылка для <b>AmneziaVPN</b> (сервер «%s») — скопировать и в приложении «+» → "
+                   "«Ввести вручную»/«Вставить»:\n<code>%s</code>" % (e(sn), e(uri)))
+    except Exception:
+        log("vpn_uri:", traceback.format_exc())
 
 
 def handle_callback(cq):
@@ -1702,6 +1784,11 @@ def handle_callback(cq):
             CFG["report"] = order[(order.index(cur) + 1) % 3]
             save_cfg()
             show(view_service())
+        elif data == "srvname":
+            pending[chat] = "srvname"
+            show(("✏️ <b>Имя сервера</b>\n\nЭто название пользователи увидят в приложении AmneziaVPN "
+                  "(в новых выданных конфигах). Сейчас: <b>%s</b>\n\nОтправьте новое имя. /cancel — отмена"
+                  % e(srv_name()), [[btn("⬅️ Сервис", "service")]]))
         elif data == "backup":
             do_backup(chat)
             show(view_service())
@@ -1771,6 +1858,14 @@ def handle_message(m):
     if pend.startswith(("exp:", "lim:")) and text and not text.startswith("/"):
         pending.pop(chat, None)
         do_set_limit(chat, pend[:3], pend[4:], text)
+        return
+    if pend == "srvname" and text and not text.startswith("/"):
+        pending.pop(chat, None)
+        CFG["server_name"] = re.sub(r"\s+", " ", text).strip()[:64]
+        save_cfg()
+        send(chat, "✅ Имя сервера: <b>%s</b>. Оно попадёт в новые выданные конфиги "
+                   "(AmneziaVPN). Выданные ранее не меняются — при необходимости перевыдайте." % e(srv_name()))
+        send(chat, *view_service())
         return
 
     cmd = text.split()[0].split("@")[0].lower() if text else ""

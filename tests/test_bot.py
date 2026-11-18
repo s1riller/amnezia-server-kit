@@ -342,6 +342,69 @@ class KitOptionsTest(FakeAwg):
         self.assertFalse(os.path.exists(bot.KIT_OPTIONS))
 
 
+CLIENT_CONF = """[Interface]
+PrivateKey = cPRIVKEY
+Address = 10.8.1.2/32
+DNS = 1.1.1.1, 1.0.0.1
+MTU = 1376
+Jc = 4
+Jmin = 10
+Jmax = 50
+S1 = 58
+S2 = 106
+H1 = 1111
+H2 = 2222
+H3 = 3333
+H4 = 4444
+
+[Peer]
+PublicKey = sPUBKEY
+PresharedKey = PSKKEY
+AllowedIPs = 0.0.0.0/0, ::/0
+Endpoint = 203.0.113.5:51820
+PersistentKeepalive = 25
+"""
+
+
+class VpnUriTest(unittest.TestCase):
+    def test_roundtrip_and_server_name(self):
+        uri = bot.build_vpn_uri(CLIENT_CONF, "Мой сервер")
+        self.assertTrue(uri.startswith("vpn://"))
+        o = bot.decode_vpn_uri(uri)
+        self.assertEqual(o["description"], "Мой сервер")        # имя, видимое пользователю
+        self.assertEqual(o["defaultContainer"], "amnezia-awg")
+        self.assertEqual(o["hostName"], "203.0.113.5")
+        awg = o["containers"][0]["awg"]
+        self.assertEqual(o["containers"][0]["container"], "amnezia-awg")
+        self.assertEqual(awg["transport_proto"], "udp")
+        self.assertEqual(awg["port"], "51820")
+        last = json.loads(awg["last_config"])
+        self.assertEqual(last["client_ip"], "10.8.1.2/32")
+        self.assertEqual(last["client_priv_key"], "cPRIVKEY")
+        self.assertEqual(last["server_pub_key"], "sPUBKEY")
+        self.assertEqual(last["psk_key"], "PSKKEY")
+        self.assertEqual(last["port"], 51820)
+        self.assertEqual(last["H1"], "1111")
+        self.assertEqual(last["allowed_ips"], ["0.0.0.0/0", "::/0"])
+        self.assertIn("[Interface]", last["config"])
+
+    def test_length_prefix(self):
+        import struct as _s, base64 as _b, zlib as _z
+        uri = bot.build_vpn_uri(CLIENT_CONF, "x")
+        raw = uri[6:] + "=" * (-len(uri[6:]) % 4)
+        blob = _b.urlsafe_b64decode(raw)
+        self.assertEqual(_s.unpack(">I", blob[:4])[0], len(_z.decompress(blob[4:])))
+
+    def test_srv_name_default(self):
+        bot.CFG.pop("server_name", None)
+        self.assertEqual(bot.srv_name(), "AmneziaWG")
+        bot.CFG["server_name"] = "   "
+        self.assertEqual(bot.srv_name(), "AmneziaWG")
+        bot.CFG["server_name"] = "Berlin-1"
+        self.assertEqual(bot.srv_name(), "Berlin-1")
+        bot.CFG.pop("server_name", None)
+
+
 class FormatTest(unittest.TestCase):
     def test_hb(self):
         self.assertEqual(bot.hb(0), "0 Б")
