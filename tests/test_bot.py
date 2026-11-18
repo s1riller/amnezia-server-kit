@@ -80,6 +80,9 @@ class FakeAwg(unittest.TestCase):
         bot.CFG.pop("blocked", None)
         bot.CFG.pop("share_mute", None)
         bot.CFG.pop("clients", None)
+        bot.CFG.pop("requests", None)
+        bot.CFG.pop("tariffs", None)
+        bot.CFG.pop("payments", None)
 
     def tearDown(self):
         for k, v in self._saved.items():
@@ -244,6 +247,39 @@ class RequestsTest(FakeAwg):
         gen = bot.set_backup_pass("")               # пустой -> случайный
         self.assertTrue(gen and gen != "my-secret-123")
         bot.CFG.pop("backup_pass", None)
+
+
+class PaymentsTest(FakeAwg):
+    def setUp(self):
+        super().setUp()
+        for fn in ("ag_sync", "send", "send_file", "send_photo", "notify_admins"):
+            self.patch(fn, (lambda *a, **k: None))
+
+    def test_tariffs_seeded(self):
+        ts = bot.tariffs()
+        self.assertTrue(ts and all("id" in t and "stars" in t for t in ts))
+        self.assertIsNotNone(bot.tariff_by_id(ts[0]["id"]))
+        self.assertTrue(bot.tariffs_enabled())
+
+    def test_purchase_new_user_creates_client(self):
+        t = {"id": "x", "label": "30д", "stars": 100, "days": 30, "gb": 50, "on": True}
+        bot.apply_purchase(999, t, charge_id="ch1", stars=100)
+        c = bot.client_owned_by(999)
+        self.assertIsNotNone(c)
+        cd = bot.cdata(c["pub"])
+        self.assertEqual(cd["owner"], 999)
+        self.assertEqual(cd["limit_gb"], 50)
+        self.assertGreater(cd["expires"], bot.today_str())
+        pay = bot.CFG["payments"][-1]
+        self.assertEqual((pay["charge_id"], pay["uid"], pay["stars"]), ("ch1", 999, 100))
+
+    def test_purchase_existing_extends_and_unlimited(self):
+        bot.set_cdata("AAAA", owner=777, expires="2030-01-01")
+        t = {"id": "x", "label": "+30", "stars": 50, "days": 30, "gb": 0, "on": True}
+        bot.apply_purchase(777, t, charge_id="ch2", stars=50)
+        cd = bot.cdata("AAAA")
+        self.assertEqual(cd["expires"], "2030-01-31")   # +30 дней от текущего срока
+        self.assertNotIn("limit_gb", cd)                # gb=0 -> без лимита
 
 
 class TrafficTest(unittest.TestCase):

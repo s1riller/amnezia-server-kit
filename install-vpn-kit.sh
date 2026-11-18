@@ -1737,7 +1737,8 @@ def btn(t, d):
 BACK = [btn("⬅️ Меню", "menu")]
 MAIN_KB = [[btn("📊 Статус", "status"), btn("👥 Клиенты", "clients")],
            [btn("➕ Новый клиент", "add"), btn("🛡 AdGuard", "adguard")],
-           [btn("🇷🇺 Блокировка RU", "ru"), btn("⚙️ Сервис", "service")]]
+           [btn("🇷🇺 Блокировка RU", "ru"), btn("💳 Оплата", "pay")],
+           [btn("⚙️ Сервис", "service")]]
 
 
 def view_menu():
@@ -2087,11 +2088,18 @@ def do_approve(uid, days, gb):
 def view_cabinet(uid):
     c = client_owned_by(uid)
     if not c:
-        if str(uid) in CFG.get("requests", {}):
+        kb = []
+        if tariffs_enabled():
+            kb.append([btn("💳 Купить доступ", "buy")])
+        pending_req = str(uid) in CFG.get("requests", {})
+        if pending_req:
+            kb.append([btn("🔄 Обновить", "my")])
             return ("⏳ Ваша заявка на доступ к VPN отправлена администратору. "
-                    "Как только её одобрят, я пришлю конфигурацию сюда.", None)
-        return ("👋 Здравствуйте! Чтобы получить доступ к VPN, нажмите кнопку ниже.",
-                [[btn("📨 Запросить доступ", "req")]])
+                    "Как только её одобрят, я пришлю конфигурацию сюда." +
+                    ("\n\nИли оформите доступ сразу — кнопкой ниже." if tariffs_enabled() else ""),
+                    kb or None)
+        kb.append([btn("📨 Запросить доступ (бесплатно)", "req")])
+        return ("👋 Здравствуйте! Этот бот выдаёт доступ к VPN. Выберите вариант ниже.", kb)
     pub = c["pub"]
     cd = cdata(pub)
     blocked = is_blocked(pub)
@@ -2118,8 +2126,197 @@ def view_cabinet(uid):
     kb = []
     if c["has_conf"]:
         kb.append([btn("📄 Моя конфигурация + QR", "myconf")])
+    if tariffs_enabled():
+        kb.append([btn("💳 Купить / продлить", "buy")])
     kb.append([btn("🔄 Обновить", "my")])
     return "\n".join(lines), kb
+
+
+# ====================== оплата Telegram Stars ======================
+# Тариф: {"id","label","stars","days","gb"} — даёт days суток доступа и месячный лимит gb ГБ (0 = безлимит).
+DEFAULT_TARIFFS = [
+    {"id": "m1", "label": "30 дней · безлимит", "stars": 100, "days": 30, "gb": 0, "on": True},
+    {"id": "m3", "label": "90 дней · безлимит", "stars": 250, "days": 90, "gb": 0, "on": True},
+    {"id": "m1g", "label": "30 дней · 100 ГБ/мес", "stars": 60, "days": 30, "gb": 100, "on": True},
+]
+MAX_PAYMENTS_LOG = 200
+
+
+def tariffs():
+    if "tariffs" not in CFG:
+        CFG["tariffs"] = [dict(t) for t in DEFAULT_TARIFFS]
+        save_cfg()
+    return CFG["tariffs"]
+
+
+def tariff_by_id(tid):
+    return next((t for t in tariffs() if t.get("id") == tid), None)
+
+
+def tariffs_enabled():
+    return any(t.get("on", True) for t in tariffs())
+
+
+def send_invoice(chat, t):
+    """Выставить счёт в Telegram Stars (XTR). provider_token для звёзд не нужен."""
+    desc = "Доступ к VPN: %d дн." % t["days"] + ((" , до %d ГБ/мес" % t["gb"]) if t["gb"] else " , без лимита")
+    r = tg("sendInvoice", {
+        "chat_id": chat, "title": t["label"], "description": desc,
+        "payload": "buy:%s" % t["id"], "currency": "XTR",
+        "prices": [{"label": t["label"], "amount": int(t["stars"])}]})
+    if not r.get("ok"):
+        log("sendInvoice failed:", r.get("description"))
+        send(chat, "❌ Не удалось выставить счёт: %s" % e(r.get("description", "ошибка")))
+    return r
+
+
+def apply_purchase(uid, t, charge_id=None, stars=None):
+    """Выдать/продлить доступ после успешной оплаты (самообслуживание, без одобрения)."""
+    c = client_owned_by(uid)
+    created = False
+    if not c:
+        name = CFG.get("requests", {}).get(str(uid), {}).get("name") or ("user%s" % uid)
+        res = create_client(name.strip()[:40])
+        set_cdata(res["pub"], owner=uid)
+        CFG.get("requests", {}).pop(str(uid), None)
+        save_cfg()
+        ag_sync()
+        c = find_client(res["pub"])
+        conf = res["conf"]
+        created = True
+    pub = c["pub"]
+    cd = cdata(pub)
+    kw = {}
+    if t["days"]:
+        base = max(today_str(), cd.get("expires") or today_str())
+        bt = time.mktime(time.strptime(base, "%Y-%m-%d"))
+        kw["expires"] = time.strftime("%Y-%m-%d", time.localtime(bt + t["days"] * 86400))
+    kw["limit_gb"] = t["gb"] or None
+    kw["auto_off"] = None
+    kw["warned"] = None
+    set_cdata(pub, **kw)
+    tr = load_traffic()                       # оплаченный план — чистый счётчик трафика
+    if tr.pop(pub, None) is not None:
+        save_traffic(tr)
+    if is_blocked(pub):
+        set_blocked(pub, False)
+    # лог платежа
+    pay = CFG.setdefault("payments", [])
+    pay.append({"uid": uid, "tariff": t["id"], "stars": stars or t["stars"],
+                "charge_id": charge_id, "ts": int(time.time())})
+    del pay[:-MAX_PAYMENTS_LOG]
+    save_cfg()
+    # уведомления
+    exp = cdata(pub).get("expires")
+    msg = "✅ Оплата получена. Доступ активен%s." % ((" до %s" % exp) if exp else "")
+    if created:
+        send(uid, msg + " Ниже — ваша конфигурация.")
+        send_client_conf(uid, c["name"], c["ip"], conf, created=False)
+    else:
+        send(uid, msg)
+    send(uid, *view_cabinet(uid))
+    notify_admins("💳 Оплата %s⭐ от <b>%s</b> (ID %s): тариф «%s». Доступ выдан%s." % (
+        stars or t["stars"], e(c["name"]), uid, e(t["label"]), (" до %s" % exp) if exp else ""))
+
+
+def view_buy(uid):
+    ts = [t for t in tariffs() if t.get("on", True)]
+    if not ts:
+        return "💳 Оплата временно недоступна.", [[btn("⬅️ Назад", "my")]]
+    lines = ["💳 <b>Купить доступ к VPN</b>", "Оплата звёздами Telegram. Выберите тариф:"]
+    kb = [[btn("%s — %d⭐" % (t["label"], t["stars"]), "buytar:%s" % t["id"])] for t in ts]
+    c = client_owned_by(uid)
+    kb.append([btn("⬅️ Назад", "my" if c else "umenu")])
+    return "\n".join(lines), kb
+
+
+# ---------- админ: тарифы и платежи ----------
+def view_pay_admin():
+    ts = tariffs()
+    pays = CFG.get("payments", [])
+    income = sum(p.get("stars", 0) for p in pays if not p.get("refunded"))
+    lines = ["💳 <b>Оплата звёздами</b>",
+             "Тарифов: %d · платежей: %d · получено: %d⭐" % (len(ts), len(pays), income), ""]
+    kb = []
+    for t in ts:
+        mark = "✅" if t.get("on", True) else "🚫"
+        kb.append([btn("%s %s — %d⭐" % (mark, t["label"], t["stars"]), "tedit:%s" % t["id"])])
+    kb.append([btn("➕ Добавить тариф", "tadd"), btn("🧾 Платежи", "pays")])
+    kb.append(BACK)
+    return "\n".join(lines), kb
+
+
+def view_tariff(tid):
+    t = tariff_by_id(tid)
+    if not t:
+        return "Тариф не найден.", [[btn("⬅️ Оплата", "pay")]]
+    lines = ["💳 <b>Тариф</b>", "Название: <b>%s</b>" % e(t["label"]),
+             "Цена: <b>%d⭐</b>" % t["stars"],
+             "Срок: <b>%d дн.</b>" % t["days"],
+             "Лимит: <b>%s</b>" % (("%d ГБ/мес" % t["gb"]) if t["gb"] else "без лимита"),
+             "Показывается пользователям: <b>%s</b>" % ("да" if t.get("on", True) else "нет")]
+    kb = [[btn("💲 Цена", "tset:%s:stars" % tid), btn("📅 Срок", "tset:%s:days" % tid)],
+          [btn("📊 ГБ/мес", "tset:%s:gb" % tid), btn("✏️ Название", "tset:%s:label" % tid)],
+          [btn("🚫 Скрыть" if t.get("on", True) else "✅ Показать", "ttog:%s" % tid),
+           btn("🗑 Удалить", "tdel:%s" % tid)],
+          [btn("⬅️ Оплата", "pay")]]
+    return "\n".join(lines), kb
+
+
+def do_tariff_set(chat, tid, field, text):
+    t = tariff_by_id(tid)
+    if not t:
+        send(chat, "Тариф не найден."); return
+    text = text.strip()
+    if field == "label":
+        t["label"] = re.sub(r"\s+", " ", text)[:40]
+    else:
+        if not re.fullmatch(r"\d{1,6}", text):
+            send(chat, "Нужно целое число. Попробуйте ещё раз или /cancel."); return
+        v = int(text)
+        if field == "stars" and not (1 <= v <= 10000):
+            send(chat, "Цена в звёздах — от 1 до 10000."); return
+        t[field] = v
+    save_cfg()
+    send(chat, "✅ Сохранено.")
+    send(chat, *view_tariff(tid))
+
+
+def view_payments():
+    pays = CFG.get("payments", [])
+    if not pays:
+        return "🧾 Платежей пока нет.", [[btn("⬅️ Оплата", "pay")]]
+    lines = ["🧾 <b>Последние платежи</b>", ""]
+    kb = []
+    for i in range(len(pays) - 1, max(-1, len(pays) - 11), -1):
+        p = pays[i]
+        when = time.strftime("%d.%m %H:%M", time.localtime(p.get("ts", 0)))
+        ref = " · возврат" if p.get("refunded") else ""
+        lines.append("%s — %d⭐ · ID %s · %s%s" % (when, p.get("stars", 0), p.get("uid"),
+                                                   e(p.get("tariff", "")), ref))
+        if not p.get("refunded") and p.get("charge_id"):
+            kb.append([btn("↩️ Возврат %d⭐ (ID %s)" % (p.get("stars", 0), p.get("uid")), "ref:%d" % i)])
+    kb.append([btn("⬅️ Оплата", "pay")])
+    return "\n".join(lines), kb
+
+
+def do_refund(i):
+    pays = CFG.get("payments", [])
+    if not (0 <= i < len(pays)):
+        return "Платёж не найден."
+    p = pays[i]
+    if p.get("refunded"):
+        return "Этот платёж уже возвращён."
+    r = tg("refundStarPayment", {"user_id": p["uid"], "telegram_payment_charge_id": p["charge_id"]})
+    if r.get("ok"):
+        p["refunded"] = True
+        save_cfg()
+        try:
+            send(p["uid"], "↩️ Вам возвращены %d⭐ за VPN. Доступ может быть ограничен администратором." % p.get("stars", 0))
+        except Exception:
+            pass
+        return "✅ Возврат %d⭐ выполнен (ID %s). Доступ не отзывается автоматически — при необходимости отключите клиента вручную." % (p.get("stars", 0), p["uid"])
+    return "❌ Возврат не удался: %s" % (r.get("description") or "ошибка")
 
 
 # ====================== действия ======================
@@ -2241,6 +2438,8 @@ def handle_callback(cq):
                     show(("✅ Заявка отправлена администратору. Я пришлю конфигурацию, как только её одобрят.", None))
             elif data == "my":
                 show(view_cabinet(uid))
+            elif data == "umenu":
+                show(view_cabinet(uid))
             elif data == "myconf":
                 c = client_owned_by(uid)
                 if c and os.path.exists(conf_path(c["pub"])):
@@ -2248,6 +2447,14 @@ def handle_callback(cq):
                         send_client_conf(uid, c["name"], c["ip"], f.read())
                 else:
                     send(uid, "Конфигурация недоступна, обратитесь к администратору.")
+            elif data == "buy":
+                show(view_buy(uid))
+            elif data.startswith("buytar:"):
+                t = tariff_by_id(data[7:])
+                if not t or not t.get("on", True):
+                    show(("Тариф недоступен.", [[btn("⬅️ Назад", "buy")]]))
+                else:
+                    send_invoice(chat, t)
         except Exception:
             log("user callback %s: %s" % (data, traceback.format_exc()))
         return
@@ -2386,6 +2593,36 @@ def handle_callback(cq):
             except Exception:
                 pass
             show(view_reqs())
+        elif data == "pay":
+            show(view_pay_admin())
+        elif data.startswith("tedit:"):
+            show(view_tariff(data[6:]))
+        elif data.startswith("tset:"):
+            _, tid, field = data.split(":")
+            pending[chat] = "tset:%s:%s" % (tid, field)
+            labels = {"stars": "цену в звёздах (1–10000)", "days": "срок в днях (0 — без срока)",
+                      "gb": "месячный лимит в ГБ (0 — без лимита)", "label": "название тарифа"}
+            show(("Отправьте %s. /cancel — отмена" % labels[field], [[btn("⬅️ Назад", "tedit:" + tid)]]))
+        elif data.startswith("ttog:"):
+            t = tariff_by_id(data[5:])
+            if t:
+                t["on"] = not t.get("on", True)
+                save_cfg()
+            show(view_tariff(data[5:]))
+        elif data.startswith("tdel:"):
+            tid = data[5:]
+            CFG["tariffs"] = [t for t in tariffs() if t.get("id") != tid]
+            save_cfg()
+            show(view_pay_admin())
+        elif data == "tadd":
+            tid = "t%d" % int(time.time())
+            tariffs().append({"id": tid, "label": "Новый тариф", "stars": 100, "days": 30, "gb": 0, "on": False})
+            save_cfg()
+            show(view_tariff(tid))
+        elif data == "pays":
+            show(view_payments())
+        elif data.startswith("ref:"):
+            show((do_refund(int(data[4:])), [[btn("🧾 Платежи", "pays"), btn("⬅️ Оплата", "pay")]]))
         elif data.startswith("shign:"):
             pub = data[6:]
             CFG.setdefault("share_mute", {})[pub] = int(time.time()) + SHARE_MUTE
@@ -2534,9 +2771,42 @@ def handle_callback(cq):
         send(chat, "❌ Ошибка: %s" % e(str(ex)), [BACK])
 
 
+def handle_precheckout(pcq):
+    """Подтвердить предоплату в течение 10 сек, иначе Telegram отменит платёж."""
+    ok = (pcq.get("invoice_payload", "").startswith("buy:")
+          and tariff_by_id(pcq["invoice_payload"][4:]) is not None)
+    params = {"pre_checkout_query_id": pcq["id"], "ok": ok}
+    if not ok:
+        params["error_message"] = "Тариф больше недоступен. Средства не списаны."
+    tg("answerPreCheckoutQuery", params)
+
+
+def handle_payment(uid, sp):
+    """Начислить доступ после успешной оплаты (successful_payment)."""
+    t = tariff_by_id((sp.get("invoice_payload") or "")[4:])
+    charge = sp.get("telegram_payment_charge_id")
+    stars = sp.get("total_amount")
+    log("payment:", uid, sp.get("invoice_payload"), stars, charge)
+    if not t:
+        notify_admins("💳 Оплата %s⭐ от ID %s по неизвестному тарифу (%s). Разберитесь вручную; "
+                      "charge_id: <code>%s</code>" % (stars, uid, e(sp.get("invoice_payload", "")), e(charge or "")))
+        send(uid, "✅ Оплата получена. Администратор свяжется с вами по поводу доступа.")
+        return
+    try:
+        apply_purchase(uid, t, charge_id=charge, stars=stars)
+    except Exception:
+        log("apply_purchase:", traceback.format_exc())
+        notify_admins("⚠️ Оплата %s⭐ от ID %s прошла, но выдача доступа дала сбой. "
+                      "charge_id: <code>%s</code>" % (stars, uid, e(charge or "")))
+        send(uid, "✅ Оплата получена, но при выдаче доступа возникла ошибка. Администратор уже уведомлён.")
+
+
 def handle_message(m):
     chat = m["chat"]["id"]
     uid = m.get("from", {}).get("id")
+    if m.get("successful_payment"):
+        handle_payment(uid, m["successful_payment"])
+        return
     text = (m.get("text") or "").strip()
     if uid not in ADMINS:
         code = CFG.get("setup_code")
@@ -2548,15 +2818,8 @@ def handle_message(m):
             send(chat, "✅ Вы зарегистрированы как администратор.")
             send(chat, *view_menu())
             return
-        # обычный пользователь: личный кабинет или подача заявки на доступ
-        if client_owned_by(uid):
-            send(chat, *view_cabinet(uid))
-        elif str(uid) in CFG.get("requests", {}):
-            send(chat, "⏳ Ваша заявка уже на рассмотрении у администратора. Ожидайте.")
-        else:
-            send(chat, "👋 Здравствуйте! Этот бот выдаёт доступ к VPN. "
-                       "Нажмите кнопку, чтобы отправить заявку администратору.",
-                 [[btn("📨 Запросить доступ", "req")]])
+        # обычный пользователь: личный кабинет / покупка / заявка на доступ
+        send(chat, *view_cabinet(uid))
         return
 
     if pending.get(chat) == "add_name" and text and not text.startswith("/"):
@@ -2585,6 +2848,11 @@ def handle_message(m):
         set_backup_pass(text)
         send(chat, "✅ Пароль бэкапа установлен. ⚠️ Прежние бэкапы открываются старым паролем.")
         send(chat, *view_service())
+        return
+    if pend.startswith("tset:") and text and not text.startswith("/"):
+        pending.pop(chat, None)
+        _, tid, field = pend.split(":")
+        do_tariff_set(chat, tid, field, text)
         return
 
     cmd = text.split()[0].split("@")[0].lower() if text else ""
@@ -2812,7 +3080,7 @@ def main():
     while True:
         try:
             r = tg("getUpdates", {"timeout": 50, "offset": offset,
-                                  "allowed_updates": ["message", "callback_query"]}, timeout=70)
+                                  "allowed_updates": ["message", "callback_query", "pre_checkout_query"]}, timeout=70)
             if not r.get("ok"):
                 log("getUpdates:", r.get("description"))
                 time.sleep(10)
@@ -2822,6 +3090,8 @@ def main():
                 try:
                     if "callback_query" in u:
                         handle_callback(u["callback_query"])
+                    elif "pre_checkout_query" in u:
+                        handle_precheckout(u["pre_checkout_query"])
                     elif "message" in u:
                         handle_message(u["message"])
                 except Exception:
