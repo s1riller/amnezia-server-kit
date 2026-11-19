@@ -373,6 +373,21 @@ class AccessLogicTest(unittest.TestCase):
         self.assertFalse(bot.is_over_limit({}, 999 * bot.GB))
 
 
+class TrafficAnalyzerTest(unittest.TestCase):
+    def test_entropy_bounds(self):
+        self.assertEqual(bot.byte_entropy(b""), 0.0)
+        self.assertEqual(bot.byte_entropy(b"\x00" * 100), 0.0)          # один байт — нулевая энтропия
+        self.assertAlmostEqual(bot.byte_entropy(bytes(range(256))), 8.0, places=6)  # равномерно — 8
+        self.assertLess(bot.byte_entropy(b"GET / HTTP/1.1\r\n" * 10), 6.0)          # текст — низкая
+
+    def test_classify_header(self):
+        self.assertEqual(bot.classify_header(b"\x01\x00\x00\x00abcd"), "wg")   # ванильный WireGuard
+        self.assertEqual(bot.classify_header(b"\x16\x03\x01\x00"), "tls")
+        self.assertEqual(bot.classify_header(b"\xc3\xff\xff"), "quic")
+        self.assertEqual(bot.classify_header(b"\x17\x9a\x2b\x4c"), "other")     # обфусцированный
+        self.assertEqual(bot.classify_header(b""), "other")
+
+
 class BlockDetectTest(unittest.TestCase):
     def test_block_suspected_true(self):
         # сервер в сети, пик активных был >=3, сейчас 0, прошло >3 мин после перезапуска

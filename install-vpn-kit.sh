@@ -502,6 +502,7 @@ import fcntl
 import html
 import ipaddress
 import json
+import math
 import os
 import re
 import shutil
@@ -1867,7 +1868,131 @@ def view_vpncheck():
                      "жалуются — возможна блокировка провайдером (режут IP или порт).")
     else:
         lines.append("\n🟢 Сервер исправен, выходит в интернет, клиенты подключаются.")
-    return "\n".join(lines), [[btn("🔄 Ещё раз", "vpncheck")], BACK]
+    return "\n".join(lines), [[btn("🔬 Анализ трафика (DPI)", "traffic"), btn("🔄 Ещё раз", "vpncheck")], BACK]
+
+
+# ---------- анализатор «зашифрованности» трафика (взгляд DPI) ----------
+HI_ENTROPY = 7.5          # байт/байт: выше — «похоже на шифр/случайность»
+
+
+def byte_entropy(data):
+    """Энтропия Шеннона полезной нагрузки, 0..8 бит/байт."""
+    if not data:
+        return 0.0
+    freq = collections.Counter(data)
+    n = len(data)
+    return -sum((c / n) * math.log2(c / n) for c in freq.values())
+
+
+def classify_header(p):
+    """Грубая классификация первых байт полезной нагрузки."""
+    if len(p) >= 4 and p[0] in (1, 2, 3, 4) and p[1] == 0 and p[2] == 0 and p[3] == 0:
+        return "wg"       # ванильный заголовок WireGuard (тип 1..4 + нулевые reserved)
+    if len(p) >= 3 and p[0] == 0x16 and p[1] == 0x03:
+        return "tls"      # TLS-запись
+    if len(p) >= 1 and (p[0] & 0xC0) == 0xC0:
+        return "quic"     # QUIC long header (грубо)
+    return "other"
+
+
+def awg_listen_port():
+    try:
+        _, iface, _ = awg_conf()
+        p = dict(iface).get("ListenPort", "")
+        return int(p) if str(p).isdigit() else 0
+    except Exception:
+        return 0
+
+
+def capture_awg_udp(port, seconds=6, max_pkts=600):
+    """Сырой захват UDP-пакетов на порту AmneziaWG (AF_PACKET, нужен root/Linux).
+    -> list[payload_bytes]. Анализируем нагрузку так, как её видит наблюдатель в сети."""
+    wan = wan_iface()
+    try:
+        s = socket.socket(socket.AF_PACKET, socket.SOCK_RAW, socket.ntohs(0x0003))
+    except (AttributeError, PermissionError, OSError) as ex:
+        raise RuntimeError("захват недоступен (нужен root/Linux): %s" % ex)
+    out = []
+    try:
+        if wan:
+            s.bind((wan, 0))
+        s.settimeout(1.0)
+        end = time.time() + seconds
+        while time.time() < end and len(out) < max_pkts:
+            try:
+                frame = s.recv(65535)
+            except socket.timeout:
+                continue
+            if len(frame) < 14:
+                continue
+            eth = struct.unpack("!H", frame[12:14])[0]
+            off = 14
+            if eth == 0x8100 and len(frame) >= 18:      # VLAN-метка
+                eth = struct.unpack("!H", frame[16:18])[0]
+                off = 18
+            if eth != 0x0800:                            # только IPv4
+                continue
+            ip = frame[off:]
+            if len(ip) < 20 or ip[9] != 17:              # только UDP
+                continue
+            ihl = (ip[0] & 0x0F) * 4
+            udp = ip[ihl:]
+            if len(udp) < 8:
+                continue
+            sport, dport = struct.unpack("!HH", udp[:4])
+            if port not in (sport, dport):
+                continue
+            out.append(udp[8:])
+    finally:
+        s.close()
+    return out
+
+
+def view_traffic():
+    port = awg_listen_port()
+    if not port:
+        return "<b>🔬 Анализ трафика</b>\n🔴 Не удалось определить порт AmneziaWG.", [[btn("⬅️ Назад", "status")]]
+    try:
+        pkts = capture_awg_udp(port)
+    except Exception as ex:
+        return "<b>🔬 Анализ трафика</b>\n🔴 %s" % e(str(ex)), [[btn("🔄 Ещё раз", "traffic")], BACK]
+    kb = [[btn("🔄 Ещё раз", "traffic")], BACK]
+    if not pkts:
+        return ("<b>🔬 Анализ трафика VPN</b>\nЗа 6 c на порту %d пакетов не поймано. "
+                "Нужен активный клиент (попросите кого-то пользоваться VPN в момент анализа)." % port, kb)
+    ent = [byte_entropy(p) for p in pkts if p]
+    sizes = [len(p) for p in pkts]
+    hdr = collections.Counter(classify_header(p) for p in pkts)
+    mean_ent = sum(ent) / len(ent) if ent else 0.0
+    hi = sum(1 for h in ent if h >= HI_ENTROPY)
+    hi_pct = 100.0 * hi / len(ent) if ent else 0
+    small = sum(1 for z in sizes if z < 120)
+    mid = sum(1 for z in sizes if 120 <= z <= 300)
+    big = sum(1 for z in sizes if z > 1000)
+    uniq = len(set(sizes))
+    lines = ["<b>🔬 Анализ трафика VPN</b> (взгляд наблюдателя в сети)",
+             "Порт AmneziaWG: %d · поймано пакетов: %d за ~6 c" % (port, len(pkts)),
+             "Средняя энтропия: %.2f бит/байт (шифр ≈ 8.0)" % mean_ent,
+             "Высокоэнтропийных (≥%.1f): %.0f%%" % (HI_ENTROPY, hi_pct),
+             "Размеры: мелкие&lt;120: %d · 120–300: %d · &gt;1000: %d · разных размеров: %d" % (small, mid, big, uniq),
+             "Заголовки: WG-ванильный %d · TLS %d · QUIC %d · прочее %d"
+             % (hdr["wg"], hdr["tls"], hdr["quic"], hdr["other"])]
+    # вердикт: важна НЕ высокая энтропия (она ожидаема у шифра), а отпечаток
+    if hdr["wg"]:
+        lines.append("\n🔴 В %d пакетах — <b>ванильный заголовок WireGuard</b>. Обфускация не маскирует "
+                     "тип сообщения, такой трафик DPI распознаёт. Проверьте H1–H4 в настройках сервера "
+                     "(приложение Amnezia) и перевыпустите конфиги." % hdr["wg"])
+    elif mean_ent >= 7.8 and hi_pct >= 90 and uniq <= 3:
+        lines.append("\n🟠 Трафик — почти однородный высокоэнтропийный UDP без узнаваемого рукопожатия и "
+                     "с малой вариативностью размеров. Для DPI это типичный признак VPN. Помогает добавление "
+                     "мусорных пакетов и разброса размеров (Jc/Jmin/Jmax, S1/S2 в AmneziaWG).")
+    else:
+        lines.append("\n🟢 Ванильного WG-заголовка нет, есть вариативность — трафик выделяется слабее. "
+                     "Высокая энтропия сама по себе нормальна (данные шифрованы); DPI ловит именно "
+                     "фиксированные заголовки/размеры, а их здесь не видно.")
+    lines.append("\n<i>Оценка приблизительная: на коротких пакетах энтропия шумит, сжатые данные похожи "
+                 "на шифрованные. Анализируется только трафик вашего сервера.</i>")
+    return "\n".join(lines), kb
 
 
 # ---------- канарейка: установка на хост в РФ ----------
@@ -2573,6 +2698,9 @@ def handle_callback(cq):
         elif data == "vpncheck":
             wait("Проверяю доступность…")
             show(view_vpncheck())
+        elif data == "traffic":
+            wait("Снимаю трафик ~6 секунд…")
+            show(view_traffic())
         elif data == "clients":
             show(view_clients())
         elif data.startswith("c:"):
