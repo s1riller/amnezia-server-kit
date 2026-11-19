@@ -1,6 +1,6 @@
 #!/bin/bash
 # =====================================================================
-#  VPN Server Kit — надстройки для сервера Amnezia (AmneziaWG)
+#  Amnezia Server Kit — надстройки для сервера Amnezia (AmneziaWG)
 #
 #  Ставит: блокировку российских IP для клиентов VPN, AdGuard Home
 #  (свой DNS, статистика по клиентам, детский режим), запрет SMTP,
@@ -42,7 +42,7 @@ usage() { cat <<'EOF'
   --no-adguard        не ставить AdGuard Home (свой DNS, фильтрация, детский режим)
   --no-auto-reboot    не перезагружать сервер ночью после обновлений ядра
   --no-bot            не ставить Telegram-бота
-  --uninstall         удалить VPN Server Kit (AmneziaWG и клиенты остаются)
+  --uninstall         удалить Amnezia Server Kit (AmneziaWG и клиенты остаются)
   --restore <файл>    восстановить из зашифрованного бэкапа бота (переезд на новый сервер)
   --pass <пароль>     пароль бэкапа для --restore (иначе спросит)
   -y, --yes           не спрашивать подтверждение (для --uninstall)
@@ -116,7 +116,7 @@ detect() {
 
 save_options() {
   put "$OPTIONS_FILE" 644 <<EOF
-# VPN Server Kit: параметры установки. Повторный запуск установщика их учитывает,
+# Amnezia Server Kit: параметры установки. Повторный запуск установщика их учитывает,
 # бот меняет RU_BLOCK и RU_DNS, когда вы переключаете блокировку в его меню.
 KIT_VERSION=$KIT_VERSION
 RU_BLOCK=$RU_BLOCK
@@ -160,7 +160,7 @@ APT::Periodic::AutocleanInterval "7";
 EOF
   local reboot=false; [ "$AUTO_REBOOT" = 1 ] && reboot=true
   put /etc/apt/apt.conf.d/52unattended-upgrades-local 644 <<EOF
-// VPN Server Kit: перезагрузка, если обновление ядра/библиотек её требует — ночью
+// Amnezia Server Kit: перезагрузка, если обновление ядра/библиотек её требует — ночью
 Unattended-Upgrade::Automatic-Reboot "$reboot";
 Unattended-Upgrade::Automatic-Reboot-Time "04:00";
 Unattended-Upgrade::Remove-Unused-Kernel-Packages "true";
@@ -325,7 +325,7 @@ selftest() {
 }
 
 summary() {
-  say "Готово (VPN Server Kit $KIT_VERSION)"
+  say "Готово (Amnezia Server Kit $KIT_VERSION)"
   if [ "$BOT" = 1 ]; then
     local tok adm code
     tok=$(python3 -c 'import json; print("1" if json.load(open("/etc/vpn-bot/config.json"))["token"] else "")')
@@ -352,7 +352,7 @@ summary() {
 
 uninstall() {
   [ "$(id -u)" = 0 ] || die "Запустите от root (sudo -i)"
-  say "Удаление VPN Server Kit"
+  say "Удаление Amnezia Server Kit"
   cat <<'EOF'
    Будут удалены: Telegram-бот, AdGuard Home (с настройками и статистикой), блокировка RU,
    правила для клиентов VPN (SMTP, DNS → AdGuard, детский режим, отключённые клиенты).
@@ -404,7 +404,7 @@ EOF
   for c in $(docker ps --format '{{.Names}}' | grep '^amnezia-' | grep -v '^amnezia-dns' || true); do
     docker restart "$c" >/dev/null && ok "перезапущен $c"
   done
-  say "VPN Server Kit удалён"
+  say "Amnezia Server Kit удалён"
   echo "   ufw, fail2ban, автообновления и BBR остались. Отключить межсетевой экран: ufw disable"
   echo
 }
@@ -428,7 +428,7 @@ restore() {
        | tar xzf - -C "$tmp" 2>/dev/null; then
     rm -rf "$tmp"; die "Не удалось расшифровать — неверный пароль или повреждённый файл"
   fi
-  [ -d "$tmp/etc/vpn-bot" ] || { rm -rf "$tmp"; die "В архиве нет данных бота — это не бэкап VPN Server Kit"; }
+  [ -d "$tmp/etc/vpn-bot" ] || { rm -rf "$tmp"; die "В архиве нет данных бота — это не бэкап Amnezia Server Kit"; }
   cp -a "$tmp/." / 2>/dev/null || true
   rm -rf "$tmp"
   ok "файлы бэкапа восстановлены (клиенты, ключи, настройки AdGuard и бота)"
