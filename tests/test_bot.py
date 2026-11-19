@@ -343,6 +343,24 @@ class AccessLogicTest(unittest.TestCase):
         self.assertFalse(bot.is_over_limit({}, 999 * bot.GB))
 
 
+class BlockDetectTest(unittest.TestCase):
+    def test_block_suspected_true(self):
+        # сервер в сети, пик активных был >=3, сейчас 0, прошло >3 мин после перезапуска
+        self.assertTrue(bot.block_suspected(0, 5, True, 600))
+
+    def test_not_when_clients_active(self):
+        self.assertFalse(bot.block_suspected(2, 5, True, 600))
+
+    def test_not_when_low_peak(self):
+        self.assertFalse(bot.block_suspected(0, 2, True, 600))
+
+    def test_not_when_egress_down(self):
+        self.assertFalse(bot.block_suspected(0, 5, False, 600))   # это проблема сервера, не блокировка
+
+    def test_not_right_after_restart(self):
+        self.assertFalse(bot.block_suspected(0, 5, True, 60))
+
+
 class ClientConfTest(unittest.TestCase):
     def test_build_client_conf(self):
         iface = bot.block_items(bot.split_blocks(SERVER_CONF)[0])

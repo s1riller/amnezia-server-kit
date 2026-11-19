@@ -1842,7 +1842,30 @@ def view_status():
         lines.append("🚫 fail2ban: заблокировано IP — %d" % b)
     if os.path.exists("/var/run/reboot-required"):
         lines.append("\n⚠️ После обновлений нужна перезагрузка — выполнится автоматически в 04:00")
-    return "\n".join(lines), [[btn("🔄 Обновить", "status")], BACK]
+    return "\n".join(lines), [[btn("🩺 Проверка доступности", "vpncheck"), btn("🔄 Обновить", "status")], BACK]
+
+
+def view_vpncheck():
+    if not container_state(AWG_CONTAINER)[0]:
+        return "<b>🩺 Проверка доступности VPN</b>\n🔴 Контейнер AmneziaWG не запущен.", \
+               [[btn("🔄 Ещё раз", "vpncheck")], BACK]
+    eg = server_egress_ok()
+    cl = get_clients()
+    now = time.time()
+    online = sum(1 for c in cl if c["hs"] and now - c["hs"] < ONLINE_SEC)
+    active = sum(1 for c in cl if c["hs"] and now - c["hs"] < BLOCK_HS_RECENT)
+    lines = ["<b>🩺 Проверка доступности VPN</b>",
+             "%s Выход сервера в интернет" % ok_icon(eg),
+             "👥 Клиентов: %d · онлайн: %d · активны за 5 мин: %d" % (len(cl), online, active)]
+    if not eg:
+        lines.append("\n🔴 Сам сервер не выходит в интернет — это проблема сервера/хостера, "
+                     "а не блокировка у провайдера клиента.")
+    elif len(cl) > 0 and active == 0:
+        lines.append("\n⚠️ Сервер исправен и в сети, но активных клиентов нет. Если пользователи "
+                     "жалуются — возможна блокировка провайдером (режут IP или порт).")
+    else:
+        lines.append("\n🟢 Сервер исправен, выходит в интернет, клиенты подключаются.")
+    return "\n".join(lines), [[btn("🔄 Ещё раз", "vpncheck")], BACK]
 
 
 def view_clients():
@@ -2471,6 +2494,9 @@ def handle_callback(cq):
             show(view_menu())
         elif data == "status":
             show(view_status())
+        elif data == "vpncheck":
+            wait("Проверяю доступность…")
+            show(view_vpncheck())
         elif data == "clients":
             show(view_clients())
         elif data.startswith("c:"):
@@ -2898,6 +2924,27 @@ def handle_message(m):
 
 
 # ====================== мониторинг ======================
+EGRESS_EVERY = 300        # как часто проверять выход сервера в интернет, сек
+BLOCK_HS_RECENT = 300     # клиент «активен», если рукопожатие было за последние N сек
+BLOCK_MIN_ACTIVE = 3      # минимум одновременно активных, чтобы массовый отвал был значимым
+BLOCK_WINDOW = 900        # окно для пикового числа активных, сек
+BLOCK_REALERT = 3600      # не чаще раза в час повторять тревогу о блокировке
+
+
+def server_egress_ok():
+    """Выходит ли сам сервер в интернет: TCP 443 к публичным IP (минуя DNS/AdGuard)."""
+    for ip in ("1.1.1.1", "8.8.8.8"):
+        rc, _, _ = dexec("nc", "-z", "-w", "4", ip, "443", timeout=12)
+        if rc == 0:
+            return True
+    return False
+
+
+def block_suspected(active_now, peak_active, egress_ok, secs_since_awg_change):
+    """Похоже ли на блокировку: сервер исправен и в сети, но все недавно активные клиенты разом исчезли."""
+    return bool(egress_ok) and active_now == 0 and peak_active >= BLOCK_MIN_ACTIVE and secs_since_awg_change > 180
+
+
 def monitor():
     with open("/proc/uptime") as f:
         uptime = float(f.read().split()[0])
@@ -2910,6 +2957,9 @@ def monitor():
     flags = {"disk": False, "mem": False, "reboot": False}
     seen = None   # pub -> был ли когда-либо handshake
     last_report = today_str()   # при старте не слать отчёт за «сегодня»
+    active_hist = collections.deque()     # (ts, число активных клиентов)
+    last_egress = 0.0; egress_ok = True; egress_alerted = False
+    block_alerted = 0.0; awg_changed_at = time.time()
     titles = {AWG_CONTAINER: "VPN (AmneziaWG)", ADGUARD_CONTAINER: "AdGuard Home"}
     while True:
         alerts = []
@@ -2924,6 +2974,8 @@ def monitor():
                         alerts.append("🟢 %s: снова работает" % title)
                     elif st[0] and prev[1] != st[1]:
                         alerts.append("🔄 %s: контейнер перезапустился" % title)
+                    if name == AWG_CONTAINER and st != prev:
+                        awg_changed_at = time.time()   # после перезапуска VPN рукопожатия сбрасываются
                 cont[name] = st
 
             d = shutil.disk_usage("/")
@@ -2957,6 +3009,30 @@ def monitor():
                         if c["hs"] and not seen.get(c["pub"]):
                             alerts.append("🆕 Клиент <b>%s</b> подключился впервые" % e(c["name"]))
                 seen = {c["pub"]: bool(c["hs"]) or (seen or {}).get(c["pub"], False) for c in cl}
+
+                # автопроверка доступности: выход сервера в интернет + массовый отвал клиентов
+                now_ts = time.time()
+                active = sum(1 for c in cl if c["hs"] and now_ts - c["hs"] < BLOCK_HS_RECENT)
+                active_hist.append((now_ts, active))
+                while active_hist and now_ts - active_hist[0][0] > BLOCK_WINDOW:
+                    active_hist.popleft()
+                peak = max((a for _, a in active_hist), default=0)
+                if now_ts - last_egress >= EGRESS_EVERY:
+                    last_egress = now_ts
+                    egress_ok = server_egress_ok()
+                    if not egress_ok and not egress_alerted:
+                        alerts.append("🔴 Сервер не выходит в интернет — у клиентов VPN не работает. "
+                                      "Проверьте сеть сервера/хостера.")
+                        egress_alerted = True
+                    elif egress_ok and egress_alerted:
+                        alerts.append("🟢 Выход сервера в интернет восстановлен.")
+                        egress_alerted = False
+                if (block_suspected(active, peak, egress_ok, now_ts - awg_changed_at)
+                        and now_ts - block_alerted > BLOCK_REALERT):
+                    block_alerted = now_ts
+                    alerts.append("⚠️ Возможно, VPN заблокирован провайдером: сервер исправен и выходит "
+                                  "в интернет, но все недавно активные клиенты (до %d) разом отключились. "
+                                  "Проверьте доступность у пользователей — возможно, режут IP или порт." % peak)
 
             # раз в день в REPORT_HOUR: отчёт (если включён) и проверка обновлений
             now = time.localtime()
