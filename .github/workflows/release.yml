@@ -22,9 +22,14 @@ jobs:
             echo "::error::install-vpn-kit.sh не пересобран из src/"; exit 1
           fi
           ver=$(sed -n 's/^KIT_VERSION="\(.*\)"$/\1/p' install-vpn-kit.sh)
-          if [ "v$ver" != "$GITHUB_REF_NAME" ]; then
-            echo "::error::KIT_VERSION=$ver не совпадает с тегом $GITHUB_REF_NAME"; exit 1
-          fi
+          # Предрелиз: тег с дефисом (например v1.4.0-rc1) — не становится latest,
+          # пользователи его не получают; строгую сверку версии для него не делаем.
+          case "$GITHUB_REF_NAME" in
+            *-*) echo "PRERELEASE=--prerelease" >> "$GITHUB_ENV" ;;
+            *)   if [ "v$ver" != "$GITHUB_REF_NAME" ]; then
+                   echo "::error::KIT_VERSION=$ver не совпадает с тегом $GITHUB_REF_NAME"; exit 1
+                 fi ;;
+          esac
           shellcheck -s bash install-vpn-kit.sh canary/install-canary.sh
           python3 -m unittest discover -s tests
 
@@ -38,4 +43,4 @@ jobs:
           gh release create "$GITHUB_REF_NAME" \
             install-vpn-kit.sh install-vpn-kit.sh.sha256 \
             canary/install-canary.sh canary/vpn-canary.py \
-            --title "VPN Server Kit $GITHUB_REF_NAME" --generate-notes --verify-tag
+            --title "VPN Server Kit $GITHUB_REF_NAME" --generate-notes --verify-tag $PRERELEASE

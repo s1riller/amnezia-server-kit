@@ -1624,12 +1624,22 @@ def view_obfs():
     lines.append("\nСмена даёт серверу уникальную подпись и ломает сигнатуры DPI.\n"
                  "⚠️ VPN перезапустится (~10 c), и всем клиентам нужен новый конфиг — "
                  "бот перевышлет тем, у кого есть кабинет; остальных нужно раздать вручную.")
-    return "\n".join(lines), [[btn("🎲 Сменить маскировку", "obfsrot")], [btn("⬅️ Сервис", "service")]]
+    auto = CFG.get("auto_rotate")
+    lines.append("\n🤖 Автосмена при подозрении на блок: <b>%s</b>." % ("включена" if auto else "выключена"))
+    if auto:
+        lines.append("Если сервер исправен, но все активные клиенты разом отвалились, бот сам сменит "
+                     "маскировку (не чаще раза в 6 ч). Это серверная эвристика, не канарейка — возможны "
+                     "ложные срабатывания и лишние переподключения. Включайте после проверки кнопки вручную.")
+    kb = [[btn("🎲 Сменить маскировку", "obfsrot")],
+          [btn("🤖 Автосмена: ВКЛ (выключить)" if auto else "🤖 Автосмена: выкл (включить)", "obfsauto")],
+          [btn("⬅️ Сервис", "service")]]
+    return "\n".join(lines), kb
 
 
 # ---------- канарейка: установка на хост в РФ ----------
 CANARY_NAME = "canary"
-CANARY_INSTALLER = "https://github.com/%s/releases/latest/download/install-canary.sh" % REPO
+# ставим канарейку из ветки main (не зависит от канала релиза — работает и с предрелизом)
+CANARY_INSTALLER = "https://raw.githubusercontent.com/%s/main/canary/install-canary.sh" % REPO
 
 
 def canary_conf_b64():
@@ -2601,6 +2611,10 @@ def handle_callback(cq):
                   [[btn("✅ Да, сменить", "obfsok"), btn("❌ Отмена", "obfs")]]))
         elif data == "obfsok":
             do_rotate_obfs(chat)
+        elif data == "obfsauto":
+            CFG["auto_rotate"] = not CFG.get("auto_rotate")
+            save_cfg()
+            show(view_obfs())
         elif data == "caninstall":
             wait("Готовлю команду установки…")
             try:
@@ -2830,7 +2844,7 @@ def monitor():
     last_report = today_str()   # при старте не слать отчёт за «сегодня»
     active_hist = collections.deque()     # (ts, число активных клиентов)
     last_egress = 0.0; egress_ok = True; egress_alerted = False
-    block_alerted = 0.0; awg_changed_at = time.time()
+    block_alerted = 0.0; awg_changed_at = time.time(); last_auto_rotate = 0.0
     titles = {AWG_CONTAINER: "VPN (AmneziaWG)", ADGUARD_CONTAINER: "AdGuard Home"}
     while True:
         alerts = []
@@ -2904,6 +2918,22 @@ def monitor():
                     alerts.append("⚠️ Возможно, VPN заблокирован провайдером: сервер исправен и выходит "
                                   "в интернет, но все недавно активные клиенты (до %d) разом отключились. "
                                   "Проверьте доступность у пользователей — возможно, режут IP или порт." % peak)
+                    # опциональная авто-смена маскировки (по умолчанию выключена), не чаще раза в 6 ч
+                    if CFG.get("auto_rotate") and now_ts - last_auto_rotate > 21600:
+                        last_auto_rotate = now_ts
+                        try:
+                            nv = gen_headers()
+                            ok, msg = set_obfs_headers(nv)
+                            if ok:
+                                r, _, _ = reissue_after_rotation(nv)
+                                awg_changed_at = time.time()
+                                notify_admins("🔄 Авто-смена маскировки из-за подозрения на блок. "
+                                              "Новые конфиги отправлены клиентам с кабинетом: %d. "
+                                              "Проверьте доступность (и канарейку, если есть)." % len(r))
+                            else:
+                                notify_admins("⚠️ Авто-смена маскировки не удалась: %s" % e(msg))
+                        except Exception:
+                            log("auto_rotate:", traceback.format_exc())
 
             # раз в день в REPORT_HOUR: отчёт (если включён) и проверка обновлений
             now = time.localtime()

@@ -12,7 +12,8 @@
 # =====================================================================
 set -Eeuo pipefail
 REPO="s1riller/amnezia-server-kit"
-REL="https://github.com/$REPO/releases/latest/download"
+# vpn-canary.py тянем с ветки main (не зависит от канала релиза — работает и для предрелизов)
+PY_URL="https://raw.githubusercontent.com/$REPO/main/canary/vpn-canary.py"
 
 TOKEN=""; CHAT=""; LABEL="канарейка"; INTERVAL="300"; CONF=""; CONF_B64=""; HARDEN=1
 
@@ -152,7 +153,7 @@ install_canary() {
     cp -f "$CONF" /root/canary.conf
   fi
   chmod 600 /root/canary.conf
-  curl -fsSL "$REL/vpn-canary.py" -o /opt/vpn-canary/vpn-canary.py || die "не удалось скачать vpn-canary.py из релиза"
+  curl -fsSL "$PY_URL" -o /opt/vpn-canary/vpn-canary.py || die "не удалось скачать vpn-canary.py"
   python3 -m py_compile /opt/vpn-canary/vpn-canary.py || die "vpn-canary.py не компилируется"
 
   cat > /etc/systemd/system/vpn-canary.service <<EOF
