@@ -388,6 +388,24 @@ class TrafficAnalyzerTest(unittest.TestCase):
         self.assertEqual(bot.classify_header(b""), "other")
 
 
+class ObfsTest(unittest.TestCase):
+    def test_gen_headers_distinct(self):
+        for _ in range(50):
+            h = bot.gen_headers()
+            vals = [int(h[k]) for k in ("H1", "H2", "H3", "H4")]
+            self.assertEqual(len(set(vals)), 4)          # все различны
+            self.assertTrue(all(v >= 5 for v in vals))   # не 1..4 (типы WireGuard)
+
+    def test_set_conf_param_only_target_line(self):
+        conf = ("[Interface]\nPrivateKey = X\nH1 = 1\nH2 = 2\n\n"
+                "[Peer]\nPublicKey = Y\nAllowedIPs = 0.0.0.0/0\n")
+        out = bot._set_conf_param(conf, "H1", "123456")
+        self.assertIn("H1 = 123456", out)
+        self.assertIn("H2 = 2", out)                     # соседний не тронут
+        self.assertIn("PublicKey = Y", out)              # [Peer] не тронут
+        self.assertIn("AllowedIPs = 0.0.0.0/0", out)
+
+
 class BlockDetectTest(unittest.TestCase):
     def test_block_suspected_true(self):
         # сервер в сети, пик активных был >=3, сейчас 0, прошло >3 мин после перезапуска

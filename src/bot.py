@@ -1506,6 +1506,127 @@ def view_traffic():
     return "\n".join(lines), kb
 
 
+# ---------- смена маскировки (магические заголовки H1–H4 AmneziaWG) ----------
+def _set_conf_param(text, key, val):
+    """Заменить значение параметра key в тексте конфига (строки `key = …`)."""
+    return re.sub(r"(?mi)^(\s*%s\s*=\s*).*$" % re.escape(key), lambda m: m.group(1) + str(val), text)
+
+
+def obfs_headers():
+    """Текущие H1–H4 из [Interface] сервера."""
+    try:
+        _, iface, _ = awg_conf()
+    except Exception:
+        return {}
+    d = dict(iface)
+    return {k: d[k] for k in ("H1", "H2", "H3", "H4") if k in d}
+
+
+def gen_headers():
+    """Четыре различных случайных значения ≥5 (1–4 заняты типами WireGuard)."""
+    import secrets
+    vals = set()
+    while len(vals) < 4:
+        vals.add(5 + secrets.randbelow(2_000_000_000))
+    v = list(vals)
+    return {"H1": str(v[0]), "H2": str(v[1]), "H3": str(v[2]), "H4": str(v[3])}
+
+
+def set_obfs_headers(newvals):
+    """Сменить H1–H4 на сервере с бэкапом, перезапуском и автооткатом. -> (ok, сообщение)."""
+    with _awg_lock:
+        old = read_file(AWG_CONF)
+        if not all(k in old for k in ("H1", "H2", "H3", "H4")):
+            return False, "в конфиге нет H1–H4 (эта версия AmneziaWG их не использует)"
+        backup_awg()
+        conf = old
+        for k, val in newvals.items():
+            conf = _set_conf_param(conf, k, val)
+        write_file(AWG_CONF, conf)
+    run(["docker", "restart", AWG_CONTAINER], timeout=120)
+    time.sleep(4)
+    up = container_state(AWG_CONTAINER)[0]
+    rc = dexec("awg", "show", AWG_IF)[0] if up else 1
+    egress = server_egress_ok() if up else False
+    if not (up and rc == 0 and egress):
+        with _awg_lock:
+            write_file(AWG_CONF, old)                    # автооткат
+        run(["docker", "restart", AWG_CONTAINER], timeout=120)
+        time.sleep(3)
+        run([VPN_NET_SCRIPT], timeout=60)
+        return False, "VPN не поднялся с новыми параметрами (up=%s awg=%s egress=%s) — выполнен откат" % (up, rc == 0, egress)
+    run([VPN_NET_SCRIPT], timeout=60)
+    enforce_blocked()
+    return True, "ok"
+
+
+def reissue_after_rotation(newvals):
+    """Переписать H1–H4 в сохранённых конфигах клиентов и разослать владельцам. -> (отправлено, без_кабинета, из_приложения)."""
+    reissued, unowned, appmade = [], [], 0
+    for c in get_clients():
+        pub = c["pub"]
+        if not c["has_conf"]:
+            appmade += 1
+            continue
+        try:
+            with open(conf_path(pub), encoding="utf-8") as f:
+                text = f.read()
+        except OSError:
+            continue
+        for k, val in newvals.items():
+            text = _set_conf_param(text, k, val)
+        save_client_conf(pub, text)
+        owner = cdata(pub).get("owner")
+        if owner:
+            send(owner, "🔄 Параметры VPN обновлены — вот новая конфигурация. Старая больше не подключится.")
+            send_client_conf(owner, c["name"], c["ip"], text)
+            reissued.append(c["name"])
+        else:
+            unowned.append(c["name"])
+    return reissued, unowned, appmade
+
+
+def do_rotate_obfs(chat):
+    send(chat, "⏳ Меняю маскировку (H1–H4) и перезапускаю VPN (~10 c, клиенты переподключатся)…")
+    newvals = gen_headers()
+    try:
+        ok, msg = set_obfs_headers(newvals)
+    except Exception as ex:
+        log("rotate_obfs:", traceback.format_exc())
+        send(chat, "❌ Ошибка при смене маскировки: %s. Параметры могли не измениться — проверьте 📊 Статус." % e(str(ex)),
+             [[btn("⬅️ Назад", "obfs")]])
+        return
+    if not ok:
+        send(chat, "❌ Не удалось: %s. Клиенты не затронуты." % e(msg), [[btn("⬅️ Назад", "obfs")]])
+        return
+    reissued, unowned, appmade = reissue_after_rotation(newvals)
+    txt = ["✅ Маскировка обновлена, VPN поднялся. Новые заголовки: <code>%s</code>"
+           % e(" ".join("%s=%s" % (k, newvals[k]) for k in ("H1", "H2", "H3", "H4"))),
+           "Перевыпущено и отправлено клиентам с кабинетом: %d" % len(reissued)]
+    if unowned:
+        txt.append("Без кабинета — раздайте конфиг вручную (карточка клиента → «Конфиг + QR»): %d" % len(unowned))
+    if appmade:
+        txt.append("Созданы в приложении Amnezia — переимпортируйте из приложения: %d" % appmade)
+    send(chat, "\n".join(txt), [[btn("⬅️ Назад", "obfs")]])
+
+
+def view_obfs():
+    h = obfs_headers()
+    if not h:
+        return ("<b>🕵️ Маскировка</b>\n\nВ конфиге сервера нет H1–H4 — эта версия AmneziaWG их не "
+                "использует, менять нечего.", [[btn("⬅️ Сервис", "service")]])
+    vanilla = all(h.get(k) == str(i) for i, k in enumerate(("H1", "H2", "H3", "H4"), 1))
+    lines = ["<b>🕵️ Маскировка трафика</b> (заголовки AmneziaWG H1–H4)",
+             "Текущие: <code>%s</code>" % e(" ".join("%s=%s" % (k, h[k]) for k in ("H1", "H2", "H3", "H4") if k in h))]
+    if vanilla:
+        lines.append("\n🔴 Заголовки = 1,2,3,4 — как у ванильного WireGuard, который DPI распознаёт. "
+                     "Рекомендую сменить.")
+    lines.append("\nСмена даёт серверу уникальную подпись и ломает сигнатуры DPI.\n"
+                 "⚠️ VPN перезапустится (~10 c), и всем клиентам нужен новый конфиг — "
+                 "бот перевышлет тем, у кого есть кабинет; остальных нужно раздать вручную.")
+    return "\n".join(lines), [[btn("🎲 Сменить маскировку", "obfsrot")], [btn("⬅️ Сервис", "service")]]
+
+
 # ---------- канарейка: установка на хост в РФ ----------
 CANARY_NAME = "canary"
 CANARY_INSTALLER = "https://github.com/%s/releases/latest/download/install-canary.sh" % REPO
@@ -1738,7 +1859,7 @@ def view_service():
                 e(srv_name()), REPORT_LABELS[mode]))
     kb = [[btn("✏️ Имя сервера", "srvname")],
           [btn("💾 Бэкап в Telegram", "backup"), btn("🔑 Пароль бэкапа", "bpass")],
-          [btn("🩺 Канарейка", "canary")],
+          [btn("🩺 Канарейка", "canary"), btn("🕵️ Маскировка", "obfs")],
           [btn("⬆️ Обновить набор" if nv else "⬆️ Проверить обновления", "update")],
           [btn("📈 Отчёт: %s" % REPORT_LABELS[mode], "reptgl")],
           [btn("🔄 Перезапустить VPN", "ask:rvpn")],
@@ -2471,6 +2592,15 @@ def handle_callback(cq):
             show(view_bpass())
         elif data == "canary":
             show(view_canary())
+        elif data == "obfs":
+            show(view_obfs())
+        elif data == "obfsrot":
+            show(("🎲 Сменить маскировку (H1–H4)?\n\nVPN перезапустится, все текущие конфиги перестанут "
+                  "подключаться — бот перевышлет новые клиентам с кабинетом, остальных раздадите вручную.\n"
+                  "Перед сменой делается бэкап; если VPN не поднимется — автоматический откат.",
+                  [[btn("✅ Да, сменить", "obfsok"), btn("❌ Отмена", "obfs")]]))
+        elif data == "obfsok":
+            do_rotate_obfs(chat)
         elif data == "caninstall":
             wait("Готовлю команду установки…")
             try:
