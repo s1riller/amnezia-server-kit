@@ -23,10 +23,10 @@ jobs:
           fi
 
       - name: shellcheck
-        run: shellcheck -s bash src/install.template.sh src/block-ru.sh src/vpn-net.sh src/vpn-bot-token install-vpn-kit.sh
+        run: shellcheck -s bash src/install.template.sh src/block-ru.sh src/vpn-net.sh src/vpn-bot-token install-vpn-kit.sh canary/install-canary.sh
 
       - name: Синтаксис bash
-        run: bash -n install-vpn-kit.sh
+        run: bash -n install-vpn-kit.sh canary/install-canary.sh
 
   test:
     runs-on: ubuntu-latest
@@ -41,7 +41,7 @@ jobs:
           python-version: ${{ matrix.python }}
 
       - name: Синтаксис Python
-        run: python -c 'import ast, sys; [ast.parse(open(f, encoding="utf-8").read(), f) for f in sys.argv[1:]]' src/bot.py src/adguard-sync-clients src/build.py
+        run: python -c 'import ast, sys; [ast.parse(open(f, encoding="utf-8").read(), f) for f in sys.argv[1:]]' src/bot.py src/adguard-sync-clients src/build.py canary/vpn-canary.py
 
       - name: Тесты
         run: python -m unittest discover -s tests -v

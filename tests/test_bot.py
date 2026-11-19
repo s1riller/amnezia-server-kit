@@ -282,6 +282,36 @@ class PaymentsTest(FakeAwg):
         self.assertNotIn("limit_gb", cd)                # gb=0 -> без лимита
 
 
+class CanaryTest(FakeAwg):
+    def setUp(self):
+        super().setUp()
+        self.patch("ag_sync", lambda: None)
+
+    def test_install_cmd(self):
+        bot.CFG["token"] = "TOK123"
+        bot.CFG["server_name"] = "Berlin"
+        try:
+            cmd = bot.canary_install_cmd(777)
+        finally:
+            bot.CFG.pop("token", None); bot.CFG.pop("server_name", None)
+        self.assertIn("install-canary.sh", cmd)
+        self.assertIn("--token TOK123", cmd)
+        self.assertIn("--chat 777", cmd)
+        self.assertIn("--label 'Berlin'", cmd)
+        b64 = cmd.split("--conf-b64 ", 1)[1].strip()
+        import base64 as _b
+        self.assertIn("[Interface]", _b.b64decode(b64).decode())
+
+    def test_canary_client_reused(self):
+        bot.ag_sync = lambda: None
+        bot.canary_install_cmd(1)                      # создаёт клиента canary
+        n1 = sum(1 for c in bot.get_clients() if c["name"] == bot.CANARY_NAME)
+        bot.canary_install_cmd(1)                      # повторно — не плодит новых
+        n2 = sum(1 for c in bot.get_clients() if c["name"] == bot.CANARY_NAME)
+        self.assertEqual(n1, 1)
+        self.assertEqual(n2, 1)
+
+
 class TrafficTest(unittest.TestCase):
     def test_account_delta_normal(self):
         self.assertEqual(bot.account_delta(100, 250), 150)

@@ -774,8 +774,10 @@ def notify_admins(text):
 
 
 # ====================== shell ======================
-def run(cmd, inp=None, timeout=60):
+def run(cmd, inp=None, timeout=60, env=None):
     kw = {"input": inp} if inp is not None else {"stdin": subprocess.DEVNULL}
+    if env is not None:
+        kw["env"] = env
     try:
         p = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout, **kw)
         return p.returncode, p.stdout, p.stderr
@@ -1868,6 +1870,79 @@ def view_vpncheck():
     return "\n".join(lines), [[btn("🔄 Ещё раз", "vpncheck")], BACK]
 
 
+# ---------- канарейка: установка на хост в РФ ----------
+CANARY_NAME = "canary"
+CANARY_INSTALLER = "https://github.com/%s/releases/latest/download/install-canary.sh" % REPO
+
+
+def canary_conf_b64():
+    """Конфиг канареечного клиента (создаётся при необходимости) в base64."""
+    c = next((c for c in get_clients() if c["name"] == CANARY_NAME and c["has_conf"]), None)
+    if c:
+        with open(conf_path(c["pub"]), encoding="utf-8") as f:
+            text = f.read()
+    else:
+        r = create_client(CANARY_NAME)
+        ag_sync()
+        text = r["conf"]
+    return base64.b64encode(text.encode()).decode()
+
+
+def canary_install_cmd(admin_chat):
+    """Готовая команда для запуска на Linux-хосте в России."""
+    label = re.sub(r"[^\w .-]", "", srv_name())[:30] or "canary"
+    return ("curl -fsSL %s | bash -s -- --token %s --chat %s --label '%s' --conf-b64 %s"
+            % (CANARY_INSTALLER, CFG.get("token", ""), admin_chat, label, canary_conf_b64()))
+
+
+def view_canary():
+    text = ("<b>🩺 Канарейка</b>\n\n"
+            "Проверяет доступность VPN из сети пользователя (нужен отдельный Linux-хост "
+            "<b>в России</b>) и шлёт тревогу при блокировке.\n\n"
+            "• <b>Команда установки</b> — пришлю строку, вставьте её на хосте (от root). "
+            "Скрипт поставит канарейку и защитит хост (ufw, fail2ban, автообновления, BBR).\n"
+            "• <b>Установить по SSH</b> — бот сам зайдёт и поставит (нужны логин и пароль хоста).\n\n"
+            "⚠️ В обоих случаях токен бота окажется на хосте канарейки.")
+    kb = [[btn("📋 Команда установки", "caninstall")],
+          [btn("🔐 Установить по SSH", "canssh")],
+          BACK]
+    return text, kb
+
+
+def do_canary_ssh(chat, line):
+    parts = line.split()
+    if len(parts) < 2 or "@" not in parts[0]:
+        send(chat, "Формат: <code>root@IP[:порт] пароль [метка]</code>. /cancel — отмена")
+        return
+    dest, password = parts[0], parts[1]
+    label = re.sub(r"[^\w .-]", "", " ".join(parts[2:]))[:30] or "canary"
+    user_host, _, port = dest.partition(":")
+    port = port or "22"
+    if not shutil.which("sshpass") or not shutil.which("ssh"):
+        send(chat, "На сервере нет <code>sshpass</code>/<code>ssh</code>. Обновите набор "
+                   "(⚙️ Сервис → «Обновить набор») — он их поставит — и повторите.", [[btn("⬅️ Канарейка", "canary")]])
+        return
+    send(chat, "⏳ Подключаюсь к <code>%s</code> и ставлю канарейку. Это может занять несколько минут…" % e(user_host))
+    try:
+        b64 = canary_conf_b64()
+    except Exception as ex:
+        send(chat, "❌ Не удалось подготовить конфиг канарейки: %s" % e(str(ex)), [[btn("⬅️ Канарейка", "canary")]])
+        return
+    remote = ("curl -fsSL %s | bash -s -- --token %s --chat %s --label '%s' --conf-b64 %s"
+              % (CANARY_INSTALLER, CFG.get("token", ""), chat, label, b64))
+    env = dict(os.environ, SSHPASS=password)
+    rc, out, err = run(["sshpass", "-e", "ssh", "-o", "StrictHostKeyChecking=accept-new",
+                        "-o", "ConnectTimeout=20", "-p", port, user_host, remote], env=env, timeout=600)
+    tail = e((out + err).strip()[-1200:] or "нет вывода")
+    if rc == 0:
+        send(chat, "✅ Канарейка установлена на <code>%s</code>.\n\n<pre>%s</pre>" % (e(user_host), tail),
+             [[btn("⬅️ Канарейка", "canary")]])
+    else:
+        hint = "неверные логин/пароль/хост или нет SSH" if rc in (5, 255) else "см. вывод"
+        send(chat, "❌ Не удалось (код %d, %s):\n\n<pre>%s</pre>" % (rc, hint, tail),
+             [[btn("⬅️ Канарейка", "canary")]])
+
+
 def view_clients():
     cl = get_clients()
     lines = ["<b>👥 Клиенты (%d)</b>" % len(cl), "🟢 онлайн · ⚪️ нет подключения последние 3 мин", ""]
@@ -2027,6 +2102,7 @@ def view_service():
                 e(srv_name()), REPORT_LABELS[mode]))
     kb = [[btn("✏️ Имя сервера", "srvname")],
           [btn("💾 Бэкап в Telegram", "backup"), btn("🔑 Пароль бэкапа", "bpass")],
+          [btn("🩺 Канарейка", "canary")],
           [btn("⬆️ Обновить набор" if nv else "⬆️ Проверить обновления", "update")],
           [btn("📈 Отчёт: %s" % REPORT_LABELS[mode], "reptgl")],
           [btn("🔄 Перезапустить VPN", "ask:rvpn")],
@@ -2754,6 +2830,28 @@ def handle_callback(cq):
             show(view_service())
         elif data == "bpass":
             show(view_bpass())
+        elif data == "canary":
+            show(view_canary())
+        elif data == "caninstall":
+            wait("Готовлю команду установки…")
+            try:
+                cmd = canary_install_cmd(chat)
+            except Exception as ex:
+                show(("❌ Не удалось подготовить: %s" % e(str(ex)), [[btn("⬅️ Канарейка", "canary")]]))
+            else:
+                send(chat, "📋 Запустите это на Linux-хосте <b>в России</b> (от root):")
+                send_file(chat, "install-canary.command.sh", cmd.encode(),
+                          "Команда установки канарейки. Запуск: <code>bash install-canary.command.sh</code>")
+                send(chat, "⚠️ Токен бота окажется на этом хосте. Хост должен быть в РФ (иначе проверка "
+                           "бессмысленна). После установки канарейка сама пришлёт статус в этот чат.",
+                     [[btn("⬅️ Канарейка", "canary")]])
+        elif data == "canssh":
+            pending[chat] = "canssh"
+            show(("🔐 Отправьте данные SSH хоста канарейки одной строкой:\n"
+                  "<code>root@IP пароль [метка]</code>\n"
+                  "например: <code>root@203.0.113.9 S3cret МТС-Москва</code>\n\n"
+                  "Пароль используется один раз и не сохраняется. После установки "
+                  "удалите это сообщение с паролем. /cancel — отмена", [[btn("⬅️ Канарейка", "canary")]]))
         elif data == "bpgen":
             new = set_backup_pass("")
             send(chat, "✅ Новый случайный пароль бэкапа создан:\n<tg-spoiler><code>%s</code></tg-spoiler>\n\n"
@@ -2885,6 +2983,10 @@ def handle_message(m):
         pending.pop(chat, None)
         _, tid, field = pend.split(":")
         do_tariff_set(chat, tid, field, text)
+        return
+    if pend == "canssh" and text and not text.startswith("/"):
+        pending.pop(chat, None)
+        do_canary_ssh(chat, text)
         return
 
     cmd = text.split()[0].split("@")[0].lower() if text else ""
@@ -3275,9 +3377,9 @@ install_packages() {
   export DEBIAN_FRONTEND=noninteractive
   apt-get -o DPkg::Lock::Timeout=1800 update -q >/dev/null
   apt-get -o DPkg::Lock::Timeout=1800 install -y -q ipset curl ufw fail2ban unattended-upgrades \
-    qrencode python3 iproute2 util-linux >/tmp/vpnkit-apt.log 2>&1 \
+    qrencode python3 iproute2 util-linux openssh-client sshpass >/tmp/vpnkit-apt.log 2>&1 \
     || { tail -15 /tmp/vpnkit-apt.log; die "Не удалось установить пакеты"; }
-  ok "ipset, ufw, fail2ban, unattended-upgrades, qrencode"
+  ok "ipset, ufw, fail2ban, unattended-upgrades, qrencode, ssh/sshpass"
 }
 
 setup_bbr() {

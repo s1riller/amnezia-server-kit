@@ -25,7 +25,7 @@ jobs:
           if [ "v$ver" != "$GITHUB_REF_NAME" ]; then
             echo "::error::KIT_VERSION=$ver не совпадает с тегом $GITHUB_REF_NAME"; exit 1
           fi
-          shellcheck -s bash install-vpn-kit.sh
+          shellcheck -s bash install-vpn-kit.sh canary/install-canary.sh
           python3 -m unittest discover -s tests
 
       - name: Контрольная сумма
@@ -35,5 +35,7 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          gh release create "$GITHUB_REF_NAME" install-vpn-kit.sh install-vpn-kit.sh.sha256 \
+          gh release create "$GITHUB_REF_NAME" \
+            install-vpn-kit.sh install-vpn-kit.sh.sha256 \
+            canary/install-canary.sh canary/vpn-canary.py \
             --title "VPN Server Kit $GITHUB_REF_NAME" --generate-notes --verify-tag

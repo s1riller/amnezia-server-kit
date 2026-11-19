@@ -132,9 +132,9 @@ install_packages() {
   export DEBIAN_FRONTEND=noninteractive
   apt-get -o DPkg::Lock::Timeout=1800 update -q >/dev/null
   apt-get -o DPkg::Lock::Timeout=1800 install -y -q ipset curl ufw fail2ban unattended-upgrades \
-    qrencode python3 iproute2 util-linux >/tmp/vpnkit-apt.log 2>&1 \
+    qrencode python3 iproute2 util-linux openssh-client sshpass >/tmp/vpnkit-apt.log 2>&1 \
     || { tail -15 /tmp/vpnkit-apt.log; die "Не удалось установить пакеты"; }
-  ok "ipset, ufw, fail2ban, unattended-upgrades, qrencode"
+  ok "ipset, ufw, fail2ban, unattended-upgrades, qrencode, ssh/sshpass"
 }
 
 setup_bbr() {
