@@ -1,0 +1,18 @@
+[Unit]
+Description=VPN canary (checks AmneziaWG reachability from this network)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+# Заполните свои значения (токен — можно тот же, что у серверного бота):
+Environment=VPN_CANARY_TOKEN=PASTE_BOT_TOKEN
+Environment=VPN_CANARY_CHAT=PASTE_YOUR_TELEGRAM_ID
+Environment=VPN_CANARY_CONF=/root/canary.conf
+Environment=VPN_CANARY_LABEL=МТС Москва
+Environment=VPN_CANARY_INTERVAL=300
+ExecStart=/usr/bin/python3 /opt/vpn-canary/vpn-canary.py
+Restart=always
+RestartSec=15
+
+[Install]
+WantedBy=multi-user.target

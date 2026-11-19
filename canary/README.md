@@ -1,0 +1,83 @@
+# VPN-канарейка
+
+Проверяет из сети **российского провайдера**, доступен ли ваш AmneziaWG-сервер, и
+шлёт тревогу в Telegram, если провайдер его заблокировал (и когда доступ вернулся).
+
+Это нужно потому, что блокировка происходит **между пользователем и сервером** —
+сам сервер не может узнать, что у клиентов конкретного провайдера VPN не работает.
+Канарейка смотрит на сервер «глазами пользователя из РФ».
+
+## Что потребуется
+
+- Отдельный **Linux-хост в России** с root: дешёвый VPS у российского хостера, или
+  домашний ПК/Raspberry Pi на Debian/Ubuntu. (Запускать на самом VPN-сервере
+  бессмысленно — он не в сети пользователя.)
+- `amneziawg-tools` (команды `awg`, `awg-quick`) и `curl`.
+- Токен Telegram-бота (можно **тот же**, что у серверного бота) и ваш Telegram ID.
+
+> Канарейка поднимает туннель только на время проверки и с `AllowedIPs = 1.1.1.1/32`,
+> поэтому обычный трафик хоста она не перехватывает. Тревоги уходят в Telegram с
+> опущенным туннелем — значит дойдут, даже если сервер заблокирован.
+
+## Установка
+
+1. **Клиент для канарейки.** В боте создайте обычного клиента (например, с именем
+   `canary`), скачайте его `.conf` и положите на хост как `/root/canary.conf`.
+
+2. **amneziawg-tools.** Поставьте клиентские инструменты AmneziaWG. На Debian/Ubuntu
+   проще всего userspace-реализацией (без модуля ядра):
+
+   ```bash
+   apt-get update && apt-get install -y curl git build-essential make iproute2 iptables golang
+   # amneziawg-tools (awg, awg-quick)
+   git clone https://github.com/amnezia-vpn/amneziawg-tools /opt/amneziawg-tools
+   make -C /opt/amneziawg-tools/src && make -C /opt/amneziawg-tools/src install
+   # amneziawg-go (userspace, если нет модуля ядра)
+   git clone https://github.com/amnezia-vpn/amneziawg-go /opt/amneziawg-go
+   ( cd /opt/amneziawg-go && go build -o /usr/local/bin/amneziawg-go )
+   ```
+
+   Если `awg-quick` не находит реализацию — укажите userspace:
+   `export WG_QUICK_USERSPACE_IMPLEMENTATION=amneziawg-go`
+   (добавьте эту строку в `Environment=` сервиса).
+
+3. **Скрипт.**
+
+   ```bash
+   mkdir -p /opt/vpn-canary
+   cp vpn-canary.py /opt/vpn-canary/
+   cp vpn-canary.service /etc/systemd/system/
+   ```
+
+4. **Настройте** `/etc/systemd/system/vpn-canary.service` — впишите токен, ваш
+   Telegram ID, путь к `.conf`, метку точки (напр. провайдер/город) и период.
+
+5. **Запуск.**
+
+   ```bash
+   systemctl daemon-reload
+   systemctl enable --now vpn-canary
+   journalctl -u vpn-canary -f        # посмотреть лог
+   ```
+
+При старте придёт «🩺 VPN доступен», при блокировке — «⛔ VPN НЕ доступен из сети
+«…»», при восстановлении — «🟢 VPN снова доступен».
+
+## Параметры (переменные окружения)
+
+| Переменная              | Значение                                                        |
+| ----------------------- | --------------------------------------------------------------- |
+| `VPN_CANARY_TOKEN`      | токен Telegram-бота (можно тот же, что у серверного бота)        |
+| `VPN_CANARY_CHAT`       | ваш Telegram ID (куда слать тревоги)                            |
+| `VPN_CANARY_CONF`       | путь к `.conf` канареечного клиента                              |
+| `VPN_CANARY_LABEL`      | метка точки в тексте тревог, напр. `МТС Москва`                  |
+| `VPN_CANARY_INTERVAL`   | период проверки, сек (по умолчанию 300)                         |
+| `VPN_CANARY_FAILS`      | сколько неудач подряд считать блокировкой (по умолчанию 2)       |
+
+## Заметки
+
+- Хотите следить за несколькими провайдерами — поднимите по канарейке на разных
+  хостах/сетях с разными `VPN_CANARY_LABEL`.
+- Токен бота лежит на РФ-хосте. Если это нежелательно, заведите для канарейки
+  отдельного бота через @BotFather и укажите его токен.
+- Клиента `canary` в боте не удаляйте — на его ключах работает проверка.
