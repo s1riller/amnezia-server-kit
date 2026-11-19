@@ -14,6 +14,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0        # нужны все теги и история для ссылки сравнения
 
       - name: Проверки
         run: |
@@ -36,11 +38,26 @@ jobs:
       - name: Контрольная сумма
         run: sha256sum install-vpn-kit.sh > install-vpn-kit.sh.sha256
 
+      - name: Заметки о релизе из CHANGELOG.md
+        run: |
+          base="${GITHUB_REF_NAME%%-*}"                 # v1.4.0-rc1 -> v1.4.0 ; v1.4 -> v1.4
+          sec() { awk -v v="$1" '$1=="##" && $2==v {g=1; next} $1=="##" {g=0} g' CHANGELOG.md; }
+          notes="$(sec "$base")"
+          [ -n "$notes" ] || notes="$(sec "${base%.0}")"  # запасной вариант без хвостового .0
+          prev="$(git tag -l 'v*' --sort=-v:refname | grep -vxF "$GITHUB_REF_NAME" | head -n1)"
+          {
+            [ -n "$notes" ] && printf '%s\n' "$notes"
+            [ -n "$prev" ] && printf '\n**Full Changelog**: https://github.com/%s/compare/%s...%s\n' \
+              "$GITHUB_REPOSITORY" "$prev" "$GITHUB_REF_NAME"
+          } > /tmp/notes.md
+          echo "HAVE_NOTES=$([ -n "$notes" ] && echo 1 || echo 0)" >> "$GITHUB_ENV"
+
       - name: Релиз на GitHub
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
+          if [ "$HAVE_NOTES" = 1 ]; then NOTE_ARGS=(--notes-file /tmp/notes.md); else NOTE_ARGS=(--generate-notes); fi
           gh release create "$GITHUB_REF_NAME" \
             install-vpn-kit.sh install-vpn-kit.sh.sha256 \
             canary/install-canary.sh canary/vpn-canary.py \
-            --title "VPN Server Kit $GITHUB_REF_NAME" --generate-notes --verify-tag $PRERELEASE
+            --title "Amnezia Server Kit $GITHUB_REF_NAME" --verify-tag "${NOTE_ARGS[@]}" $PRERELEASE
