@@ -84,6 +84,7 @@ class FakeAwg(unittest.TestCase):
         bot.CFG.pop("requests", None)
         bot.CFG.pop("tariffs", None)
         bot.CFG.pop("payments", None)
+        bot.CFG.pop("xray", None)
 
     def tearDown(self):
         for k, v in self._saved.items():
@@ -281,6 +282,25 @@ class PaymentsTest(FakeAwg):
         cd = bot.cdata("AAAA")
         self.assertEqual(cd["expires"], "2030-01-31")   # +30 дней от текущего срока
         self.assertNotIn("limit_gb", cd)                # gb=0 -> без лимита
+
+
+class XrayTest(FakeAwg):
+    def test_vless_url(self):
+        bot.CFG["xray"] = {"privkey": "PK", "pubkey": "PUBKEY", "sid": "abcd1234",
+                           "port": 443, "sni": "www.microsoft.com"}
+        bot.set_cdata("AAAA", xray_uuid="11111111-2222-3333-4444-555555555555")
+        url = bot.vless_url("AAAA")
+        self.assertTrue(url.startswith(
+            "vless://11111111-2222-3333-4444-555555555555@203.0.113.5:443?"))
+        for frag in ("encryption=none", "security=reality", "flow=xtls-rprx-vision",
+                     "pbk=PUBKEY", "sid=abcd1234", "sni=www.microsoft.com", "type=tcp"):
+            self.assertIn(frag, url)
+
+    def test_xray_installed_flag(self):
+        self.assertFalse(bot.xray_installed())
+        bot.CFG["xray"] = {"privkey": "PK"}
+        self.assertTrue(bot.xray_installed())
+        self.assertEqual(bot.xray_sni(), "www.microsoft.com")   # дефолт, если sni не задан
 
 
 class CanaryTest(FakeAwg):

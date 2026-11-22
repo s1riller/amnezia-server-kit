@@ -513,6 +513,7 @@ import threading
 import time
 import traceback
 import urllib.error
+import urllib.parse
 import urllib.request
 import uuid
 import zlib
@@ -2169,6 +2170,143 @@ def view_obfs():
     return "\n".join(lines), kb
 
 
+# ---------- XRay (VLESS + Reality) — запасной протокол против DPI ----------
+XRAY_CONTAINER = "xray"
+XRAY_DIR = "/etc/xray"
+XRAY_CONF = XRAY_DIR + "/config.json"
+XRAY_IMAGE = "teddysun/xray"
+XRAY_SNI_DEFAULT = "www.microsoft.com"
+
+
+def xray_cfg():
+    return CFG.setdefault("xray", {})
+
+
+def xray_installed():
+    return bool(xray_cfg().get("privkey"))
+
+
+def xray_sni():
+    return (xray_cfg().get("sni") or "").strip() or XRAY_SNI_DEFAULT
+
+
+def xray_gen_keys():
+    """Пара ключей Reality через `xray x25519`. -> (private, public)."""
+    rc, out, err = run(["docker", "run", "--rm", XRAY_IMAGE, "xray", "x25519"], timeout=120)
+    if rc != 0:
+        raise RuntimeError("xray x25519: " + (err.strip() or out.strip())[:200])
+    vals = re.findall(r":\s*([A-Za-z0-9_-]{43,44})", out)
+    if len(vals) < 2:
+        raise RuntimeError("не удалось разобрать ключи x25519")
+    return vals[0], vals[1]
+
+
+def xray_write_config():
+    """Собрать config.json из настроек и UUID клиентов, записать на хост (смонтирован в контейнер)."""
+    c = xray_cfg()
+    clients = [{"id": cdata(pub).get("xray_uuid"), "flow": "xtls-rprx-vision"}
+               for pub in CFG.get("clients", {}) if cdata(pub).get("xray_uuid")]
+    conf = {
+        "log": {"loglevel": "warning"},
+        "inbounds": [{
+            "listen": "0.0.0.0", "port": c.get("port", 443), "protocol": "vless",
+            "settings": {"clients": clients, "decryption": "none"},
+            "streamSettings": {"network": "tcp", "security": "reality", "realitySettings": {
+                "dest": xray_sni() + ":443", "serverNames": [xray_sni()],
+                "privateKey": c.get("privkey", ""), "shortIds": [c.get("sid", "")]}},
+            "sniffing": {"enabled": True, "destOverride": ["http", "tls"]}}],
+        "outbounds": [{"protocol": "freedom"}],
+    }
+    os.makedirs(XRAY_DIR, exist_ok=True)
+    tmp = XRAY_CONF + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(conf, f, indent=2, ensure_ascii=False)
+    os.replace(tmp, XRAY_CONF)
+
+
+def xray_restart():
+    run(["docker", "restart", XRAY_CONTAINER], timeout=60)
+
+
+def install_xray():
+    """Поднять контейнер XRay с Reality. -> (ok, сообщение)."""
+    rc, _, err = run(["docker", "pull", "-q", XRAY_IMAGE], timeout=300)
+    if rc != 0:
+        return False, "не удалось скачать образ XRay: " + err.strip()[:200]
+    c = xray_cfg()
+    if not c.get("privkey"):
+        import secrets
+        priv, pub = xray_gen_keys()
+        c.update(privkey=priv, pubkey=pub, sid=secrets.token_hex(4), port=443)
+        c.setdefault("sni", XRAY_SNI_DEFAULT)
+        save_cfg()
+    xray_write_config()
+    run(["docker", "rm", "-f", XRAY_CONTAINER], timeout=60)
+    rc, _, err = run(["docker", "run", "-d", "--name", XRAY_CONTAINER, "--restart", "unless-stopped",
+                      "-p", "%d:%d" % (c.get("port", 443), c.get("port", 443)),
+                      "-v", XRAY_DIR + ":/etc/xray", XRAY_IMAGE], timeout=120)
+    if rc != 0:
+        return False, "не удалось запустить контейнер: " + err.strip()[:200]
+    run(["ufw", "allow", "%d/tcp" % c.get("port", 443)], timeout=30)
+    time.sleep(2)
+    if not container_state(XRAY_CONTAINER)[0]:
+        rc2, logs, _ = run(["docker", "logs", "--tail", "15", XRAY_CONTAINER], timeout=20)
+        return False, "контейнер не запустился:\n" + e(logs.strip()[-400:])
+    return True, "ok"
+
+
+def vless_url(pub):
+    c = xray_cfg()
+    uid = cdata(pub).get("xray_uuid")
+    cl = find_client(pub)
+    name = urllib.parse.quote((cl["name"] if cl else "xray")[:40])
+    return ("vless://%s@%s:%d?encryption=none&flow=xtls-rprx-vision&security=reality"
+            "&sni=%s&fp=chrome&pbk=%s&sid=%s&type=tcp#%s"
+            % (uid, server_ip(), c.get("port", 443), urllib.parse.quote(xray_sni()),
+               c.get("pubkey", ""), c.get("sid", ""), name))
+
+
+def give_xray(chat, pub):
+    c = find_client(pub)
+    if not cdata(pub).get("xray_uuid"):
+        set_cdata(pub, xray_uuid=str(uuid.uuid4()))
+        xray_write_config()
+        xray_restart()
+    url = vless_url(pub)
+    send(chat, "🧅 <b>XRay (VLESS Reality)</b> для <b>%s</b> — запасной вход, если AmneziaWG заблокируют.\n"
+               "Импортируйте в v2rayNG / NekoBox / Hiddify по ссылке или QR:\n<code>%s</code>" % (e(c["name"] if c else "?"), e(url)))
+    png = qr_png(url)
+    if png:
+        send_photo(chat, png, "QR XRay для «%s»" % e(c["name"] if c else "?"))
+
+
+def remove_xray(pub):
+    if cdata(pub).get("xray_uuid"):
+        set_cdata(pub, xray_uuid=None)
+        xray_write_config()
+        xray_restart()
+
+
+def view_xray():
+    c = xray_cfg()
+    if not xray_installed():
+        return ("<b>🧅 XRay (VLESS + Reality)</b>\n\nЗапасной протокол, стойкий к DPI: когда AmneziaWG "
+                "режут, клиент переключается на него. Слушает порт 443, маскируется под обычный HTTPS-сайт.\n\n"
+                "⚠️ Займёт порт 443 и ресурсы. После установки выдавайте клиентам кнопкой в их карточке.",
+                [[btn("⬇️ Установить XRay", "xrinstall")], [btn("⬅️ Сервис", "service")]])
+    running = container_state(XRAY_CONTAINER)[0]
+    n = sum(1 for pub in CFG.get("clients", {}) if cdata(pub).get("xray_uuid"))
+    lines = ["<b>🧅 XRay (VLESS + Reality)</b>",
+             "%s Контейнер: %s" % (ok_icon(running), "работает" if running else "не запущен"),
+             "Маскировка (SNI): <b>%s</b>" % e(xray_sni()),
+             "Порт: %d · клиентов с XRay: %d" % (c.get("port", 443), n),
+             "\nВыдавайте XRay клиентам в их карточке («🧅 Дать XRay»)."]
+    kb = [[btn("✏️ Сайт маскировки (SNI)", "xrsni"), btn("🔁 Перезапустить", "xrrestart")],
+          [btn("♻️ Переустановить", "xrinstall"), btn("🗑 Удалить XRay", "xrremove")],
+          [btn("⬅️ Сервис", "service")]]
+    return "\n".join(lines), kb
+
+
 # ---------- канарейка: установка на хост в РФ ----------
 CANARY_NAME = "canary"
 # ставим канарейку из ветки main (не зависит от канала релиза — работает и с предрелизом)
@@ -2364,6 +2502,11 @@ def view_client(pub):
         kb.append([btn("➕ Продлить 30 дней", "cext:" + pub)])
     if off == "limit":
         kb.append([btn("♻️ Сбросить лимит", "clrst:" + pub)])
+    if xray_installed():
+        if cd.get("xray_uuid"):
+            kb.append([btn("🧅 XRay-ссылка", "cxray:" + pub), btn("🧅 Убрать XRay", "cxroff:" + pub)])
+        else:
+            kb.append([btn("🧅 Дать XRay (запасной вход)", "cxray:" + pub)])
     kb.append([btn("🔑 Новый ключ", "crk:" + pub),
                btn("✅ Включить" if blocked else "⛔ Отключить", ("cunb:" if blocked else "cblk:") + pub)])
     kb.append([btn("🗑 Удалить", "cdel:" + pub)])
@@ -2453,6 +2596,7 @@ def view_service():
     kb = [[btn("✏️ Имя сервера", "srvname")],
           [btn("💾 Бэкап в Telegram", "backup"), btn("🔑 Пароль бэкапа", "bpass")],
           [btn("🩺 Канарейка", "canary"), btn("🕵️ Маскировка", "obfs")],
+          [btn("🧅 XRay (запасной протокол)", "xray")],
           [btn("⬆️ Обновить набор" if nv else "⬆️ Проверить обновления", "update")],
           [btn("📈 Отчёт: %s" % REPORT_LABELS[mode], "reptgl")],
           [btn("🔄 Перезапустить VPN", "ask:rvpn")],
@@ -3134,8 +3278,11 @@ def handle_callback(cq):
         elif data.startswith("cdelok:"):
             pub = data[7:]
             c = find_client(pub)
+            had_xray = bool(cdata(pub).get("xray_uuid"))
             delete_client(pub)
             ag_sync()
+            if had_xray and xray_installed():      # отозвать XRay-доступ удалённого клиента
+                xray_write_config(); xray_restart()
             send(chat, "✅ Клиент <b>%s</b> удалён." % e(c["name"] if c else pub))
             show(view_clients(chat))
         elif data == "add":
@@ -3210,6 +3357,53 @@ def handle_callback(cq):
             CFG["auto_rotate"] = not CFG.get("auto_rotate")
             save_cfg()
             show(view_obfs())
+        elif data == "xray":
+            show(view_xray())
+        elif data == "xrinstall":
+            wait("Устанавливаю XRay (может занять минуту)…")
+            try:
+                ok, msg = install_xray()
+            except Exception as ex:
+                log("install_xray:", traceback.format_exc())
+                ok, msg = False, str(ex)
+            if ok:
+                show(("✅ XRay установлен и запущен. Теперь выдавайте его клиентам в их карточке "
+                      "(«🧅 Дать XRay»).", [[btn("⬅️ XRay", "xray")]]))
+            else:
+                show(("❌ Не удалось установить XRay: %s" % e(msg), [[btn("🔄 Ещё раз", "xrinstall")], [btn("⬅️ XRay", "xray")]]))
+        elif data == "xrrestart":
+            wait("Перезапускаю XRay…")
+            xray_restart()
+            show(view_xray())
+        elif data == "xrsni":
+            pending[chat] = "xrsni"
+            show(("✏️ Отправьте домен для маскировки (SNI) — сайт с поддержкой TLS 1.3, "
+                  "например <code>www.microsoft.com</code> или <code>dl.google.com</code>. Сейчас: <b>%s</b>\n"
+                  "После смены выданные XRay-ссылки нужно перевыдать. /cancel — отмена" % e(xray_sni()),
+                  [[btn("⬅️ XRay", "xray")]]))
+        elif data == "xrremove":
+            show(("🗑 Удалить XRay? Контейнер будет остановлен и удалён, XRay-доступ у клиентов перестанет "
+                  "работать (AmneziaWG не затрагивается).",
+                  [[btn("✅ Да, удалить", "xrremok"), btn("❌ Отмена", "xray")]]))
+        elif data == "xrremok":
+            wait("Удаляю XRay…")
+            run(["docker", "rm", "-f", XRAY_CONTAINER], timeout=60)
+            run(["ufw", "delete", "allow", "%d/tcp" % xray_cfg().get("port", 443)], timeout=30)
+            for pub in list(CFG.get("clients", {})):
+                if cdata(pub).get("xray_uuid"):
+                    set_cdata(pub, xray_uuid=None)
+            CFG.pop("xray", None)
+            save_cfg()
+            show(("✅ XRay удалён.", [[btn("⬅️ Сервис", "service")]]))
+        elif data.startswith("cxray:"):
+            pub = data[6:]
+            give_xray(chat, pub)
+            show(view_client(pub))
+        elif data.startswith("cxroff:"):
+            pub = data[7:]
+            remove_xray(pub)
+            send(chat, "🧅 XRay у клиента убран.")
+            show(view_client(pub))
         elif data == "caninstall":
             wait("Готовлю команду установки…")
             try:
@@ -3371,6 +3565,21 @@ def handle_message(m):
         pending.pop(chat, None)
         set_filter(chat, q=re.sub(r"\s+", " ", text).strip()[:40])
         send(chat, *view_clients(chat))
+        return
+    if pend == "xrsni" and text and not text.startswith("/"):
+        sni = re.sub(r"[^A-Za-z0-9.-]", "", text.strip())[:80]
+        if "." not in sni:
+            send(chat, "Похоже, это не домен. Пример: www.microsoft.com. Повторите или /cancel.")
+            return
+        pending.pop(chat, None)
+        xray_cfg()["sni"] = sni
+        save_cfg()
+        if xray_installed():
+            xray_write_config()
+            xray_restart()
+        send(chat, "✅ Маскировка (SNI): <b>%s</b>. Перевыдайте XRay-ссылки клиентам (в карточке), "
+                   "старые со старым SNI перестанут работать." % e(sni))
+        send(chat, *view_xray())
         return
 
     cmd = text.split()[0].split("@")[0].lower() if text else ""
