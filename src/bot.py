@@ -347,7 +347,32 @@ def conf_filename(name, ip):
 _awg_lock = threading.Lock()
 
 
+_container_pid = 0
+
+
+def container_pid():
+    """PID контейнера VPN (кешируется). Через него файлы контейнера видны на хосте как /proc/<pid>/root/…"""
+    global _container_pid
+    if not _container_pid:
+        rc, out, _ = run(["docker", "inspect", "-f", "{{.State.Pid}}", AWG_CONTAINER])
+        _container_pid = int(out.strip() or 0) if rc == 0 else 0
+    return _container_pid
+
+
+def container_pid_reset():
+    global _container_pid
+    _container_pid = 0
+
+
 def read_file(path):
+    # быстрый путь: файл контейнера читаем прямо с хоста через /proc/<pid>/root (без docker exec)
+    pid = container_pid()
+    if pid:
+        try:
+            with open("/proc/%d/root%s" % (pid, path), encoding="utf-8", errors="replace") as f:
+                return f.read()
+        except OSError:
+            container_pid_reset()   # контейнер перезапущен — PID устарел, уйдём на docker exec
     rc, out, err = dexec("cat", path)
     if rc != 0:
         raise RuntimeError("не удалось прочитать %s: %s" % (path, err.strip()))
@@ -421,20 +446,14 @@ def awg_dump():
     return peers
 
 
-_uapi_pid = 0
-
-
 def uapi_peers():
     """Состояние клиентов напрямую из управляющего сокета amneziawg-go (дёшево, без docker exec).
-    -> {pub_base64: {"endpoint": "ip:port", "hs": unix_time}}"""
-    global _uapi_pid
+    -> {pub_base64: {"endpoint": "ip:port", "hs": unix_time, "rx": байт, "tx": байт}}"""
     buf = b""
     for attempt in range(2):
-        if not _uapi_pid:
-            rc, out, _ = run(["docker", "inspect", "-f", "{{.State.Pid}}", AWG_CONTAINER])
-            _uapi_pid = int(out.strip() or 0) if rc == 0 else 0
+        pid = container_pid()
         # в Alpine /var/run -> /run (абсолютная ссылка), поэтому путь через /run
-        path = "/proc/%d/root/run/amneziawg/%s.sock" % (_uapi_pid, AWG_IF)
+        path = "/proc/%d/root/run/amneziawg/%s.sock" % (pid, AWG_IF)
         try:
             s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
             s.settimeout(3)
@@ -448,7 +467,7 @@ def uapi_peers():
             s.close()
             break
         except OSError:
-            _uapi_pid = 0
+            container_pid_reset()
             buf = b""
             if attempt:
                 raise
@@ -456,13 +475,17 @@ def uapi_peers():
     for line in buf.decode(errors="replace").splitlines():
         k, _, v = line.partition("=")
         if k == "public_key":
-            cur = {"endpoint": "", "hs": 0}
+            cur = {"endpoint": "", "hs": 0, "rx": 0, "tx": 0}
             peers[base64.b64encode(bytes.fromhex(v)).decode()] = cur
         elif cur is not None:
             if k == "endpoint":
                 cur["endpoint"] = v
             elif k == "last_handshake_time_sec":
                 cur["hs"] = int(v or 0)
+            elif k == "rx_bytes":
+                cur["rx"] = int(v or 0)
+            elif k == "tx_bytes":
+                cur["tx"] = int(v or 0)
     return peers
 
 
@@ -473,7 +496,10 @@ def conf_path(pub):
 def get_clients():
     _, _, peers = awg_conf()
     table = {c.get("clientId"): c.get("userData", {}) for c in load_table()}
-    dump = awg_dump()
+    try:
+        dump = uapi_peers()           # дёшево, без docker exec
+    except Exception:
+        dump = awg_dump()             # запасной путь (нет сокета — например, модуль ядра)
     res = []
     for p in peers:
         pub = p.get("PublicKey", "")
@@ -485,7 +511,7 @@ def get_clients():
             ip_sort = 0
         res.append({"pub": pub, "name": ud.get("clientName") or "без имени", "ip": ip, "ip_sort": ip_sort,
                     "created": ud.get("creationDate", ""), "hs": d.get("hs", 0), "rx": d.get("rx", 0),
-                    "tx": d.get("tx", 0), "endpoint": d.get("endpoint", "(none)"),
+                    "tx": d.get("tx", 0), "endpoint": d.get("endpoint") or "(none)",
                     "has_conf": os.path.exists(conf_path(pub))})
     return sorted(res, key=lambda c: c["ip_sort"])
 
@@ -1039,23 +1065,39 @@ def qr_png(text):
 
 
 # ====================== система ======================
+_cstate_cache = {}   # name -> (ts, (running, started))
+
+
 def container_state(name):
+    c = _cstate_cache.get(name)
+    if c and time.time() - c[0] < 2.5:
+        return c[1]
     rc, out, _ = run(["docker", "inspect", "-f", "{{.State.Running}}|{{.State.StartedAt}}", name])
-    if rc != 0:
-        return (False, "absent")
-    running, started = out.strip().split("|", 1)
-    return (running == "true", started)
+    st = (False, "absent") if rc != 0 else (out.strip().split("|", 1)[0] == "true", out.strip().split("|", 1)[1])
+    _cstate_cache[name] = (time.time(), st)
+    return st
+
+
+_cpu_prev = None
 
 
 def cpu_percent():
+    """Загрузка CPU без блокировки: дельта между этим и предыдущим вызовом (sleep только при самом первом)."""
+    global _cpu_prev
+
     def snap():
         with open("/proc/stat") as f:
             v = [int(x) for x in f.readline().split()[1:]]
         return v[3] + v[4], sum(v)
-    i1, t1 = snap()
-    time.sleep(0.5)
-    i2, t2 = snap()
-    return 100.0 * (1 - (i2 - i1) / max(t2 - t1, 1))
+    idle, total = snap()
+    if _cpu_prev is None:
+        _cpu_prev = (idle, total)
+        time.sleep(0.08)
+        idle, total = snap()
+    i0, t0 = _cpu_prev
+    _cpu_prev = (idle, total)
+    dt = total - t0
+    return 100.0 * (1 - (idle - i0) / dt) if dt > 0 else 0.0
 
 
 def meminfo():
@@ -1544,6 +1586,7 @@ def set_obfs_headers(newvals):
             conf = _set_conf_param(conf, k, val)
         write_file(AWG_CONF, conf)
     run(["docker", "restart", AWG_CONTAINER], timeout=120)
+    container_pid_reset()
     time.sleep(4)
     up = container_state(AWG_CONTAINER)[0]
     rc = dexec("awg", "show", AWG_IF)[0] if up else 1
@@ -1552,6 +1595,7 @@ def set_obfs_headers(newvals):
         with _awg_lock:
             write_file(AWG_CONF, old)                    # автооткат
         run(["docker", "restart", AWG_CONTAINER], timeout=120)
+        container_pid_reset()
         time.sleep(3)
         run([VPN_NET_SCRIPT], timeout=60)
         return False, "VPN не поднялся с новыми параметрами (up=%s awg=%s egress=%s) — выполнен откат" % (up, rc == 0, egress)
@@ -2665,6 +2709,7 @@ def handle_callback(cq):
         elif data == "do:rvpn":
             wait("Перезапускаю VPN…")
             rc, _, err = run(["docker", "restart", AWG_CONTAINER], timeout=120)
+            container_pid_reset()
             time.sleep(3)
             run([VPN_NET_SCRIPT], timeout=60)
             send(chat, "✅ VPN перезапущен" if rc == 0 else "❌ Ошибка: " + e(err.strip()))

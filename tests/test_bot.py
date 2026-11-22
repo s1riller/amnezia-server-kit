@@ -68,6 +68,7 @@ class FakeAwg(unittest.TestCase):
         self.patch("read_file", self.fake_read)
         self.patch("write_file", self.fake_write)
         self.patch("dexec", self.fake_dexec)
+        self.patch("container_pid", lambda: 0)   # не дёргать реальный docker в тестах
         self.patch("gen_keys", lambda: next(self.keys))
         self.patch("server_ip", lambda: "203.0.113.5")
         self.patch("CLIENTS_DIR", os.path.join(self.tmp, "clients"))
