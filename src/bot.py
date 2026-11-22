@@ -3030,6 +3030,18 @@ def share_watch():
 
 
 # ====================== main ======================
+def dispatch_update(u):
+    try:
+        if "callback_query" in u:
+            handle_callback(u["callback_query"])
+        elif "pre_checkout_query" in u:
+            handle_precheckout(u["pre_checkout_query"])
+        elif "message" in u:
+            handle_message(u["message"])
+    except Exception:
+        log("update:", traceback.format_exc())
+
+
 def main():
     if not CFG.get("token"):
         log("Токен не задан в", CONFIG_PATH)
@@ -3070,15 +3082,10 @@ def main():
                 continue
             for u in r["result"]:
                 offset = u["update_id"] + 1
-                try:
-                    if "callback_query" in u:
-                        handle_callback(u["callback_query"])
-                    elif "pre_checkout_query" in u:
-                        handle_precheckout(u["pre_checkout_query"])
-                    elif "message" in u:
-                        handle_message(u["message"])
-                except Exception:
-                    log("update:", traceback.format_exc())
+                # каждое обновление — в своём потоке, чтобы долгая операция
+                # (проверка сети, анализ трафика, смена маскировки, установка по SSH)
+                # не блокировала ответы на остальные нажатия
+                threading.Thread(target=dispatch_update, args=(u,), daemon=True).start()
         except Exception as ex:
             log("poll error:", ex)
             time.sleep(5)
