@@ -1754,19 +1754,69 @@ def do_canary_ssh(chat, line):
              [[btn("⬅️ Канарейка", "canary")]])
 
 
-def view_clients():
-    cl = get_clients()
-    lines = ["<b>👥 Клиенты (%d)</b>" % len(cl), "🟢 онлайн · ⚪️ нет подключения последние 3 мин", ""]
+client_filter = {}   # chat -> (поисковый запрос, режим)
+CLIENT_MODES = ["all", "online", "off", "soon"]
+MODE_LABEL = {"all": "все", "online": "онлайн", "off": "отключённые", "soon": "истекает ≤3д"}
+
+
+def get_filter(chat):
+    return client_filter.get(chat, ("", "all"))
+
+
+def set_filter(chat, q=None, mode=None):
+    oq, om = get_filter(chat)
+    nq = oq if q is None else q
+    nm = om if mode is None else mode
+    if not nq and nm == "all":
+        client_filter.pop(chat, None)
+    else:
+        client_filter[chat] = (nq, nm)
+
+
+def client_matches(c, q, mode, now, soon_date):
+    if q and q.lower() not in c["name"].lower() and q not in c["ip"]:
+        return False
+    if mode == "online":
+        return bool(c["hs"]) and now - c["hs"] < ONLINE_SEC
+    if mode == "off":
+        return is_blocked(c["pub"])
+    if mode == "soon":
+        exp = cdata(c["pub"]).get("expires")
+        return bool(exp) and exp <= soon_date
+    return True
+
+
+def view_clients(chat=None):
+    q, mode = get_filter(chat)
+    now = time.time()
+    soon_date = time.strftime("%Y-%m-%d", time.localtime(now + 3 * 86400))
+    allcl = get_clients()
+    cl = [c for c in allcl if client_matches(c, q, mode, now, soon_date)]
+    lines = ["<b>👥 Клиенты</b> — показано %d из %d" % (len(cl), len(allcl))]
+    filt = ([("поиск: «%s»" % e(q)) if q else ""] if q else []) + \
+           ([("фильтр: %s" % MODE_LABEL[mode])] if mode != "all" else [])
+    if filt:
+        lines.append("  " + " · ".join(x for x in filt if x))
+    lines += ["🟢 онлайн · ⚪️ нет 3 мин · ⛔ отключён", ""]
     kb = []
+    shown = 0
     for c in cl:
-        online = c["hs"] and time.time() - c["hs"] < ONLINE_SEC
+        online = c["hs"] and now - c["hs"] < ONLINE_SEC
         dot = "⛔" if is_blocked(c["pub"]) else "🟢" if online else "⚪️"
         if sum(len(x) for x in lines) < 3300:
             lines.append("%s <b>%s</b> · %s · %s · ⬇️%s ⬆️%s" % (
                 dot, e(c["name"]), c["ip"], ago(c["hs"]), hb(c["tx"]), hb(c["rx"])))
-        kb.append([btn("%s %s" % (dot, c["name"][:40]), "c:" + c["pub"])])
+        if shown < 60:
+            kb.append([btn("%s %s" % (dot, c["name"][:40]), "c:" + c["pub"])])
+            shown += 1
+    if len(cl) > 60:
+        lines.append("\n…показаны первые 60 кнопок. Уточните поиск или фильтр.")
     if not cl:
-        lines.append("Клиентов пока нет.")
+        lines.append("Ничего не найдено." if (q or mode != "all") else "Клиентов пока нет.")
+    ctl = [btn("🔍 Поиск", "csearch"), btn("Фильтр: %s" % MODE_LABEL[mode], "clmode")]
+    if q or mode != "all":
+        ctl.append(btn("✖ Сброс", "clrfilt"))
+    kb.append(ctl)
     kb.append([btn("➕ Новый клиент", "add"), btn("🔄 Обновить", "clients")])
     kb.append(BACK)
     return "\n".join(lines), kb
@@ -2388,7 +2438,19 @@ def handle_callback(cq):
             wait("Снимаю трафик ~6 секунд…")
             show(view_traffic())
         elif data == "clients":
-            show(view_clients())
+            show(view_clients(chat))
+        elif data == "csearch":
+            pending[chat] = "csearch"
+            show(("🔍 Отправьте имя или IP (часть) для поиска клиента. "
+                  "Пустое сообщение не сбрасывает — используйте «✖ Сброс». /cancel — отмена",
+                  [[btn("⬅️ К списку", "clients")]]))
+        elif data == "clmode":
+            _, m = get_filter(chat)
+            set_filter(chat, mode=CLIENT_MODES[(CLIENT_MODES.index(m) + 1) % len(CLIENT_MODES)])
+            show(view_clients(chat))
+        elif data == "clrfilt":
+            client_filter.pop(chat, None)
+            show(view_clients(chat))
         elif data.startswith("c:"):
             show(view_client(data[2:]))
         elif data.startswith("cconf:"):
@@ -2586,7 +2648,7 @@ def handle_callback(cq):
             delete_client(pub)
             ag_sync()
             send(chat, "✅ Клиент <b>%s</b> удалён." % e(c["name"] if c else pub))
-            show(view_clients())
+            show(view_clients(chat))
         elif data == "add":
             pending[chat] = "add_name"
             show(("➕ <b>Новый клиент</b>\n\nОтправьте имя (например: <i>Мама iPhone</i>).\n/cancel — отмена", [BACK]))
@@ -2816,6 +2878,11 @@ def handle_message(m):
         pending.pop(chat, None)
         do_canary_ssh(chat, text)
         return
+    if pend == "csearch" and text and not text.startswith("/"):
+        pending.pop(chat, None)
+        set_filter(chat, q=re.sub(r"\s+", " ", text).strip()[:40])
+        send(chat, *view_clients(chat))
+        return
 
     cmd = text.split()[0].split("@")[0].lower() if text else ""
     arg = text.split(maxsplit=1)[1] if len(text.split(maxsplit=1)) > 1 else ""
@@ -2823,7 +2890,7 @@ def handle_message(m):
         if cmd == "/status":
             send(chat, *view_status())
         elif cmd == "/clients":
-            send(chat, *view_clients())
+            send(chat, *view_clients(chat))
         elif cmd == "/add":
             if arg:
                 do_add(chat, arg)

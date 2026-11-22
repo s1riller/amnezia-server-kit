@@ -407,6 +407,26 @@ class ObfsTest(unittest.TestCase):
         self.assertIn("AllowedIPs = 0.0.0.0/0", out)
 
 
+class ClientFilterTest(unittest.TestCase):
+    def _c(self, name="Мама", ip="10.8.1.2", hs=0, pub="P"):
+        return {"name": name, "ip": ip, "hs": hs, "pub": pub}
+
+    def test_query_name_and_ip(self):
+        c = self._c("Мама iPhone", "10.8.1.7")
+        self.assertTrue(bot.client_matches(c, "мама", "all", 0, "2999-01-01"))   # регистр не важен
+        self.assertTrue(bot.client_matches(c, "1.7", "all", 0, "2999-01-01"))    # по IP
+        self.assertFalse(bot.client_matches(c, "папа", "all", 0, "2999-01-01"))
+
+    def test_mode_online(self):
+        import time as _t
+        now = _t.time()
+        self.assertTrue(bot.client_matches(self._c(hs=now), "", "online", now, "2999-01-01"))
+        self.assertFalse(bot.client_matches(self._c(hs=0), "", "online", now, "2999-01-01"))
+
+    def test_mode_all_passes(self):
+        self.assertTrue(bot.client_matches(self._c(), "", "all", 0, "2999-01-01"))
+
+
 class BlockDetectTest(unittest.TestCase):
     def test_block_suspected_true(self):
         # сервер в сети, пик активных был >=3, сейчас 0, прошло >3 мин после перезапуска
